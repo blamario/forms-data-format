@@ -78,34 +78,34 @@ parse = verify . inspect . feedEof . flip feed parser . ByteStringUTF8
 
 parser :: Parser ByteStringUTF8 FDF
 parser = FDF
-  <$ string "%FDF-1.2" <* lineEnd
-  <*> extract (manyTill line begin)
-  <* begin
-  <* string "/FDF" <* lineEnd
+  <$ (string "%FDF-1.2" <* lineEnd <?> "first line")
+  <*> extract ((takeWhile1 (`notElem` ["\r", "\n"]) <?> "bytes") <> lineEnd <> manyTill line begin <?> "header")
+  <* (string "/FDF" <* takeCharsWhile (== ' ') <* lineEnd <?> "end header")
   <*> field
-  <* end
+  <* (end <?> "end the fields")
   <*> extract (string "endobj" <> lineEnd
                <> takeCharsWhile isSpace
                <> string "trailer" <> lineEnd
-               <> manyTill line (string "%%EOF"))
-  <* string "%%EOF"
+               <> manyTill line (string "%%EOF" <?> "last line")
+               <?> "trailer")
   <* optional lineEnd
 
 field :: Parser ByteStringUTF8 Field
 field = Field <$ begin
-  <*> strictText (string "/T (" *> takeCharsWhile (`notElem` [')', '\r', '\n']) <* string ")" <* lineEnd)
-  <*> optional (strictText $ string "/V (" *> takeCharsWhile (`notElem` [')', '\r', '\n']) <* string ")" <* lineEnd)
-  <*> moptional (string "/Kids [" *> lineEnd *> many field <* string "]" <* lineEnd) -- kids
+  <*> strictText (string "/T (" *> takeCharsWhile (`notElem` [')', '\r', '\n']) <* string ")" <* lineEnd <?> "name")
+  <*> optional (strictText (string "/V (" *> takeCharsWhile (`notElem` [')', '\r', '\n']) <* string ")" <* lineEnd
+                            <?> "value"))
+  <*> moptional (string "/Kids [" *> lineEnd *> many field <* string "]" <* lineEnd <?> "kids")
   <* end
 
 begin :: Parser ByteStringUTF8 ()
-begin = skip (string "<<" *> lineEnd)
+begin = skip (string "<<" *> lineEnd) <?> "<<"
 
 end :: Parser ByteStringUTF8 ()
-end = skip (string ">>" *> optional lineEnd)
+end = skip (string ">>" *> optional lineEnd) <?> ">>"
 
 line :: Parser ByteStringUTF8 ByteStringUTF8
-line = takeCharsWhile (`notElem` ['\r', '\n']) <> lineEnd
+line = takeCharsWhile (`notElem` ['\r', '\n']) <> lineEnd <?> "line"
 
 lineEnd :: Parser ByteStringUTF8 ByteStringUTF8
 lineEnd = string "\r\n" <|> string "\r" <|> string "\n"

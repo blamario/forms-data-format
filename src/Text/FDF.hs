@@ -2,7 +2,11 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-module Text.FDF (mapWithKey, parse, serialize) where
+module Text.FDF (FDF (FDF, body), Field (Field, name, value, kids),
+                 mapWithKey, mapFieldWithKey,
+                 foldMapWithKey, foldMapFieldWithKey,
+                 traverseWithKey, traverseFieldWithKey,
+                 parse, serialize) where
 
 import Control.Applicative ((<*), (<*>), (<|>), many, optional)
 import Data.Char (isSpace)
@@ -29,6 +33,20 @@ mapFieldWithKey :: ([Text] -> Text -> Text) -> Field -> Field
 mapFieldWithKey f x@Field{name, value, kids} =
   x{value = f [name] <$> value,
     kids = mapFieldWithKey (f . (name:)) <$> kids}
+
+foldMapWithKey :: Monoid a => ([Text] -> Text -> a) -> FDF -> a
+foldMapWithKey f x@FDF{body} = foldMapFieldWithKey f body
+
+foldMapFieldWithKey :: Monoid a => ([Text] -> Text -> a) -> Field -> a
+foldMapFieldWithKey f x@Field{name, value, kids} =
+  foldMap (f [name]) value <> foldMap (foldMapFieldWithKey $ f . (name:)) kids
+
+traverseWithKey :: Applicative f => ([Text] -> Text -> f Text) -> FDF -> f FDF
+traverseWithKey f x@FDF{body} = (\body'-> x{body = body'}) <$> traverseFieldWithKey f body
+
+traverseFieldWithKey :: Applicative f => ([Text] -> Text -> f Text) -> Field -> f Field
+traverseFieldWithKey f x@Field{name, value, kids} =
+  Field name <$> traverse (f [name]) value <*> traverse (traverseFieldWithKey $ f . (name:)) kids
 
 serialize :: FDF -> Text
 serialize FDF{header, body, trailer} =

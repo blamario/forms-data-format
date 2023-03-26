@@ -26,6 +26,6 @@ library
     -- Modules included in this library but not exported.
     -- other-modules:
     other-extensions: ImportQualifiedPost NamedFieldPuns OverloadedStrings
-    build-depends:    base == 4.*, incremental-parser, text
+    build-depends:    base == 4.*, incremental-parser >= 0.4 && < 0.6, text
     hs-source-dirs:   src
     default-language: Haskell2010

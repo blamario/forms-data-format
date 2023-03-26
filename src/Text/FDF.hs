@@ -1,6 +1,7 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Text.FDF (FDF (FDF, body), Field (Field, name, value, kids),
                  mapWithKey, mapFieldWithKey,
@@ -8,15 +9,22 @@ module Text.FDF (FDF (FDF, body), Field (Field, name, value, kids),
                  traverseWithKey, traverseFieldWithKey,
                  parse, serialize) where
 
-import Control.Applicative ((<*), (<*>), (<|>), many, optional)
+import Control.Applicative ((<*), (<*>), (<|>), many, some, optional)
+import Data.Bifunctor (bimap)
 import Data.ByteString (ByteString)
 import Data.Char (isSpace)
 import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
-import Data.Monoid.Textual (toText)
+import Data.Monoid.Textual (toString, toText)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding (encodeUtf8)
-import Text.ParserCombinators.Incremental.LeftBiasedLocal
+import Rank2 qualified
+import Text.Grampa
+import Text.Grampa.Combinators
+import Text.Parser.Combinators (manyTill)
+import Text.Grampa.PEG.Backtrack qualified as PEG
+
+type Parser = PEG.Parser (Rank2.Only FDF)
 
 data FDF = FDF {
   header :: ByteString,
@@ -56,8 +64,11 @@ serialize :: FDF -> ByteString
 serialize FDF{header, body, trailer} =
   "%FDF-1.2\n"
   <> header
-  <> "<<\n/FDF\n"
+  <> "/FDF\n"
+  <> "<<\n"
+  <> "/Fields [\n"
   <> encodeUtf8 (serializeField body) <> "\n"
+  <> "]\n"
   <> ">>\n"
   <> trailer
   <> "%%EOF\n"
@@ -71,38 +82,44 @@ serializeField Field{name, value, kids} =
   <> ">>"
 
 parse :: ByteString -> Either String FDF
-parse = verify . inspect . feedEof . flip feed parser . ByteStringUTF8
-  where verify (Right ([(parsed, "")], Nothing)) = Right parsed
-        verify (Right _) = Left "Internal parse error"
-        verify (Left err) = Left err
+parse input =
+  bimap (\failure-> toString (const "<?>") $ failureDescription s failure 4) id $ simply parseComplete parser s
+  where s = ByteStringUTF8 input
 
 parser :: Parser ByteStringUTF8 FDF
 parser = FDF
   <$ (string "%FDF-1.2" <* lineEnd <?> "first line")
-  <*> extract ((takeWhile1 (`notElem` ["\r", "\n"]) <?> "bytes") <> lineEnd <> manyTill line begin <?> "header")
+  <*> extract ((takeWhile1 (`notElem` ["\r", "\n"]) <?> "bytes")
+               <> lineEnd <> (mconcat <$> manyTill line begin) <?> "header")
   <* (string "/FDF" <* takeCharsWhile (== ' ') <* lineEnd <?> "end header")
+  <* begin
+  <* (string "/Fields [" <* takeCharsWhile (== ' ') <* lineEnd <?> "fields")
   <*> field
-  <* (end <?> "end the fields")
-  <*> extract (string "endobj" <> lineEnd
+  <* (string "]" <* takeCharsWhile (== ' ') <* lineEnd <?> "end the fields")
+  <* (end <?> "end the body")
+  <*> extract ((end <?> "end the object")
+               <> string "endobj" <> lineEnd
                <> takeCharsWhile isSpace
                <> string "trailer" <> lineEnd
-               <> manyTill line (string "%%EOF" <?> "last line")
+               <> (mconcat <$> manyTill line (string "%%EOF" <?> "last line"))
                <?> "trailer")
   <* optional lineEnd
 
 field :: Parser ByteStringUTF8 Field
 field = Field <$ begin
   <*> strictText (string "/T (" *> takeCharsWhile (`notElem` [')', '\r', '\n']) <* string ")" <* lineEnd <?> "name")
-  <*> optional (strictText (string "/V (" *> takeCharsWhile (`notElem` [')', '\r', '\n']) <* string ")" <* lineEnd
-                            <?> "value"))
-  <*> moptional (string "/Kids [" *> lineEnd *> many field <* string "]" <* lineEnd <?> "kids")
+  <*> optional (strictText $ admit (string "/V (" *> commit (takeCharsWhile (`notElem` [')', '\r', '\n']) <* string ")" <* lineEnd)
+                                    <|> string "/V /" *> commit (takeCharsWhile (`notElem` ['\r', '\n']) <* lineEnd)
+                                    <?> "value"))
+  <*> admit (string "/Kids [" *> commit (lineEnd *> takeSome field <* string "]" <* lineEnd <?> "kids")
+             <|> commit mempty)
   <* end
 
-begin :: Parser ByteStringUTF8 ()
-begin = skip (string "<<" *> lineEnd) <?> "<<"
+begin :: Parser ByteStringUTF8 ByteStringUTF8
+begin = string "<<" *> lineEnd <?> "<<"
 
-end :: Parser ByteStringUTF8 ()
-end = skip (string ">>" *> optional lineEnd) <?> ">>"
+end :: Parser ByteStringUTF8 ByteStringUTF8
+end = string ">>" *> takeCharsWhile (== ' ') *> moptional lineEnd <?> ">>"
 
 line :: Parser ByteStringUTF8 ByteStringUTF8
 line = takeCharsWhile (`notElem` ['\r', '\n']) <> lineEnd <?> "line"

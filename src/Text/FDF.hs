@@ -64,11 +64,13 @@ serialize :: FDF -> ByteString
 serialize FDF{header, body, trailer} =
   "%FDF-1.2\n"
   <> header
+  <> "<<\n"
   <> "/FDF\n"
   <> "<<\n"
   <> "/Fields [\n"
   <> encodeUtf8 (serializeField body) <> "\n"
   <> "]\n"
+  <> ">>\n"
   <> ">>\n"
   <> trailer
   <> "%%EOF\n"
@@ -77,8 +79,8 @@ serializeField :: Field -> Text
 serializeField Field{name, value, kids} =
   "<<\n"
   <> "/T (" <> name <> ")\n"
-  <> foldMap (\v-> "/T (" <> v <> ")\n") value
-  <> if null kids then "" else "/Kids[\n" <> Text.intercalate "\n" (serializeField <$> kids) <> "]\n"
+  <> foldMap (\v-> "/V (" <> v <> ")\n") value
+  <> (if null kids then "" else "/Kids [\n" <> Text.intercalate "\n" (serializeField <$> kids) <> "]\n")
   <> ">>"
 
 parse :: ByteString -> Either String FDF

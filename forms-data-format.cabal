@@ -2,8 +2,7 @@ cabal-version:      2.4
 name:               forms-data-format
 version:            0.1.0.0
 
--- A short (one-line) description of the package.
--- synopsis:
+synopsis: Parse and serialize FDF, the Forms Data Format
 
 -- A longer description of the package.
 -- description:
@@ -18,7 +17,7 @@ maintainer:         blamario@protonmail.com
 -- A copyright notice.
 -- copyright:
 -- category:
-extra-source-files: CHANGELOG.md
+extra-source-files: CHANGELOG.md, README.md
 
 library
     exposed-modules:  Text.FDF

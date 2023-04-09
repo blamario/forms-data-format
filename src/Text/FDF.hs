@@ -121,7 +121,7 @@ begin :: Parser ByteStringUTF8 ByteStringUTF8
 begin = string "<<" *> lineEnd <?> "<<"
 
 end :: Parser ByteStringUTF8 ByteStringUTF8
-end = string ">>" *> takeCharsWhile (== ' ') *> moptional lineEnd <?> ">>"
+end = string ">>" *> takeCharsWhile (== ' ') *> moptional lineEnd *> pure mempty <?> ">>"
 
 line :: Parser ByteStringUTF8 ByteStringUTF8
 line = takeCharsWhile (`notElem` ['\r', '\n']) <> lineEnd <?> "line"

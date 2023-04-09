@@ -3,6 +3,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
 
+-- | Parse and serialize between FDF files and `Map [Text] Text`.
+
 module Text.FDF (FDF (FDF, body), Field (Field, name, value, kids),
                  mapWithKey, mapFieldWithKey,
                  foldMapWithKey, foldMapFieldWithKey,
@@ -26,12 +28,14 @@ import Text.Grampa.PEG.Backtrack qualified as PEG
 
 type Parser = PEG.Parser (Rank2.Only FDF)
 
+-- | Parsed FDF data structure
 data FDF = FDF {
   header :: ByteString,
   body :: Field,
   trailer :: ByteString}
   deriving (Show)
 
+-- | The body of FDF is a tree of nestable 'Field's.
 data Field = Field {
   name :: Text,
   value :: Maybe Text,

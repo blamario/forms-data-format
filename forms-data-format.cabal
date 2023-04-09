@@ -1,23 +1,27 @@
 cabal-version:      2.4
 name:               forms-data-format
-version:            0.1.0.0
+version:            0.2
 
 synopsis: Parse and serialize FDF, the Forms Data Format
 
--- A longer description of the package.
--- description:
+description: This is a hacked-together library to parse and serialize FDF,
+             Adobe's [Forms Data
+             Format](https://helpx.adobe.com/acrobat/kb/acrobat-forms-form-data-web.html). It
+             does not follow the specification, but seems to work for simple
+             cases.
 
--- A URL where users can report bugs.
--- bug-reports:
-
+category:           data, text
 license:            BSD-3-Clause
+license-files:      LICENSE
+copyright:          (c) 2023 Mario Blažević
 author:             Mario Blažević
 maintainer:         blamario@protonmail.com
+bug-reports:        https://github.com/blamario/forms-data-format/issues
 
--- A copyright notice.
--- copyright:
--- category:
 extra-source-files: CHANGELOG.md, README.md
+source-repository head
+  type:     git
+  location: https://github.com/blamario/forms-data-format
 
 library
     exposed-modules:  Text.FDF

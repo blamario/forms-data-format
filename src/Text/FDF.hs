@@ -36,14 +36,14 @@ data FDF = FDF {
   header :: ByteString,
   body :: Field,
   trailer :: ByteString}
-  deriving (Show)
+  deriving (Eq, Show)
 
 -- | The body of FDF is a tree of nestable 'Field's.
 data Field = Field {
   name :: Text,
   value :: Maybe Text,
   kids :: [Field]}
-  deriving (Show)
+  deriving (Eq, Show)
 
 mapWithKey :: ([Text] -> Text -> Text) -> FDF -> FDF
 mapWithKey f x@FDF{body} = x{body = mapFieldWithKey f body}

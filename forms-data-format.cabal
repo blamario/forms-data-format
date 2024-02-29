@@ -1,6 +1,6 @@
 cabal-version:      2.4
 name:               forms-data-format
-version:            0.2.0.1
+version:            0.2.1
 
 synopsis: Parse and serialize FDF, the Forms Data Format
 
@@ -29,7 +29,7 @@ library
     -- Modules included in this library but not exported.
     -- other-modules:
     other-extensions: ImportQualifiedPost NamedFieldPuns OverloadedStrings
-    build-depends:    base == 4.*, bytestring >=0.9 && < 0.13, text,
+    build-depends:    base == 4.*, bytestring >=0.9 && < 0.13, text >= 1.0 && < 2.2,
                       monoid-subclasses == 1.*, rank2classes >= 1 && < 1.6,
                       parsers < 0.13, grammatical-parsers >= 0.5 && < 0.8
     hs-source-dirs:   src

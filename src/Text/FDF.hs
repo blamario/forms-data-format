@@ -14,12 +14,13 @@ module Text.FDF (FDF (FDF, body), Field (Field, name, value, kids),
 import Control.Applicative ((<*), (<*>), (<|>), many, some, optional)
 import Data.Bifunctor (bimap)
 import Data.ByteString (ByteString)
+import Data.ByteString qualified as ByteString
 import Data.Char (chr, digitToInt, isAscii, isSpace, ord)
 import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
 import Data.Monoid.Textual (singleton, toString, toText)
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Text.Encoding (encodeUtf8)
+import Data.Text.Encoding (decodeUtf16BE, encodeUtf8, encodeUtf16BE)
 import Numeric (showOct)
 import Rank2 qualified
 import Text.Grampa
@@ -74,24 +75,26 @@ serialize FDF{header, body, trailer} =
   <> "/FDF\n"
   <> "<<\n"
   <> "/Fields [\n"
-  <> encodeUtf8 (serializeField body) <> "\n"
+  <> serializeField body <> "\n"
   <> "]\n"
   <> ">>\n"
   <> ">>\n"
   <> trailer
   <> "%%EOF\n"
 
-serializeField :: Field -> Text
+serializeField :: Field -> ByteString
 serializeField Field{name, value, kids} =
   "<<\n"
-  <> "/T (" <> name <> ")\n"
+  <> "/T (" <> encodeUtf8 name <> ")\n"
   <> foldMap (\v-> "/V (" <> serializeValue v <> ")\n") value
-  <> (if null kids then "" else "/Kids [\n" <> Text.intercalate "\n" (serializeField <$> kids) <> "]\n")
+  <> (if null kids then "" else "/Kids [\n" <> ByteString.intercalate "\n" (serializeField <$> kids) <> "]\n")
   <> ">>"
 
-serializeValue :: Text -> Text
-serializeValue t = plain <> escaped
-  where (plain, special) = Text.span (\c -> isAscii c && c >= ' ' && c `notElem` ['(', ')', '\\']) t
+serializeValue :: Text -> ByteString
+serializeValue t
+  | Text.isAscii t = encodeUtf8 (plain <> escaped)
+  | otherwise = utf16beBOM <> encodeUtf16BE t
+  where (plain, special) = Text.span (\c -> c >= ' ' && c `notElem` ['(', ')', '\\']) t
         escaped = Text.concatMap escape special
         escape '(' = Text.pack "\\("
         escape ')' = "\\)"
@@ -101,8 +104,8 @@ serializeValue t = plain <> escaped
         escape '\t' = "\\t"
         escape '\b' = "\\b"
         escape c
-          | c >= ' ' && c <= '\x7f' = Text.singleton c
-          | isAscii c = "\\" <> Text.justifyRight 3 '0' (Text.pack $ showOct (ord c) "")
+          | c < ' ' = "\\" <> Text.justifyRight 3 '0' (Text.pack $ showOct (ord c) "")
+          | otherwise = Text.singleton c
 
 parse :: ByteString -> Either String FDF
 parse input =
@@ -133,7 +136,8 @@ field = Field <$ begin
   <*> strictText (string "/T (" *> takeCharsWhile (`notElem` [')', '\r', '\n']) <* string ")" <* lineEnd <?> "name")
   <*> optional (strictText $
                 admit (string "/V ("
-                       *> commit (concatMany (takeCharsWhile1 (`notElem` [')', '\r', '\n', '\\']) <|> escape)
+                       *> commit ((string (ByteStringUTF8 utf16beBOM) *> (utf8from16 <$> Text.Grampa.takeWhile (/= ")"))
+                                   <|> concatMany (takeCharsWhile1 (`notElem` [')', '\r', '\n', '\\']) <|> escape))
                                   <* string ")" <* lineEnd)
                        <|> string "/V /" *> commit (takeCharsWhile (`notElem` ['\r', '\n']) <* lineEnd)
                        <?> "value"))
@@ -151,6 +155,7 @@ field = Field <$ begin
                                     <|> char '\\' *> pure '\\'
                                     <|> chr . sum <$> sequenceA [(64 *) <$> octalDigit, (8 *) <$> octalDigit, octalDigit]))
         octalDigit = digitToInt <$> octDigit
+        utf8from16 (ByteStringUTF8 bs) = ByteStringUTF8 (encodeUtf8 $ decodeUtf16BE bs)
 
 begin :: Parser ByteStringUTF8 ByteStringUTF8
 begin = string "<<" *> lineEnd <?> "<<"
@@ -169,3 +174,6 @@ strictText = fmap $ toText (error . ("Invalid UTF-8 sequence: " ++) . show)
 
 extract :: Parser ByteStringUTF8 ByteStringUTF8 -> Parser ByteStringUTF8 ByteString
 extract = fmap $ \(ByteStringUTF8 bs) -> bs
+
+utf16beBOM :: ByteString
+utf16beBOM = "\xFE\xFF"

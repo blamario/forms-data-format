@@ -14,12 +14,13 @@ module Text.FDF (FDF (FDF, body), Field (Field, name, value, kids),
 import Control.Applicative ((<*), (<*>), (<|>), many, some, optional)
 import Data.Bifunctor (bimap)
 import Data.ByteString (ByteString)
-import Data.Char (chr, digitToInt, isSpace)
+import Data.Char (chr, digitToInt, isAscii, isSpace, ord)
 import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
 import Data.Monoid.Textual (singleton, toString, toText)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding (encodeUtf8)
+import Numeric (showOct)
 import Rank2 qualified
 import Text.Grampa
 import Text.Grampa.Combinators
@@ -84,9 +85,24 @@ serializeField :: Field -> Text
 serializeField Field{name, value, kids} =
   "<<\n"
   <> "/T (" <> name <> ")\n"
-  <> foldMap (\v-> "/V (" <> v <> ")\n") value
+  <> foldMap (\v-> "/V (" <> serializeValue v <> ")\n") value
   <> (if null kids then "" else "/Kids [\n" <> Text.intercalate "\n" (serializeField <$> kids) <> "]\n")
   <> ">>"
+
+serializeValue :: Text -> Text
+serializeValue t = plain <> escaped
+  where (plain, special) = Text.span (\c -> isAscii c && c >= ' ' && c `notElem` ['(', ')', '\\']) t
+        escaped = Text.concatMap escape special
+        escape '(' = Text.pack "\\("
+        escape ')' = "\\)"
+        escape '\\' = "\\\\"
+        escape '\n' = "\\n"
+        escape '\r' = "\\r"
+        escape '\t' = "\\t"
+        escape '\b' = "\\b"
+        escape c
+          | c >= ' ' && c <= '\x7f' = Text.singleton c
+          | isAscii c = "\\" <> Text.justifyRight 3 '0' (Text.pack $ showOct (ord c) "")
 
 parse :: ByteString -> Either String FDF
 parse input =
@@ -125,15 +141,15 @@ field = Field <$ begin
              <|> commit mempty)
   <* end
   where escape = char '\\'
-                 *> (char 'n' *> pure "\n"
-                     <|> char 'r' *> pure "\r"
-                     <|> char 't' *> pure "\t"
-                     <|> char 'b' *> pure "\b"
-                     <|> char 'f' *> pure "\f"
-                     <|> char '(' *> pure "("
-                     <|> char ')' *> pure ")"
-                     <|> char '\\' *> pure "\\"
-                     <|> singleton . chr . sum <$> sequenceA [(64 *) <$> octalDigit, (8 *) <$> octalDigit, octalDigit])
+                 *> (singleton <$> (char 'n' *> pure '\n'
+                                    <|> char 'r' *> pure '\r'
+                                    <|> char 't' *> pure '\t'
+                                    <|> char 'b' *> pure '\b'
+                                    <|> char 'f' *> pure '\f'
+                                    <|> char '(' *> pure '('
+                                    <|> char ')' *> pure ')'
+                                    <|> char '\\' *> pure '\\'
+                                    <|> chr . sum <$> sequenceA [(64 *) <$> octalDigit, (8 *) <$> octalDigit, octalDigit]))
         octalDigit = digitToInt <$> octDigit
 
 begin :: Parser ByteStringUTF8 ByteStringUTF8

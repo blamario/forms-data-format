@@ -14,15 +14,16 @@ module Text.FDF (FDF (FDF, body), Field (Field, name, value, kids),
 import Control.Applicative ((<*), (<*>), (<|>), many, some, optional)
 import Data.Bifunctor (bimap)
 import Data.ByteString (ByteString)
-import Data.Char (isSpace)
+import Data.Char (chr, digitToInt, isSpace)
 import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
-import Data.Monoid.Textual (toString, toText)
+import Data.Monoid.Textual (singleton, toString, toText)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding (encodeUtf8)
 import Rank2 qualified
 import Text.Grampa
 import Text.Grampa.Combinators
+import Text.Parser.Char (octDigit)
 import Text.Parser.Combinators (manyTill)
 import Text.Grampa.PEG.Backtrack qualified as PEG
 
@@ -114,12 +115,26 @@ parser = FDF
 field :: Parser ByteStringUTF8 Field
 field = Field <$ begin
   <*> strictText (string "/T (" *> takeCharsWhile (`notElem` [')', '\r', '\n']) <* string ")" <* lineEnd <?> "name")
-  <*> optional (strictText $ admit (string "/V (" *> commit (takeCharsWhile (`notElem` [')', '\r', '\n']) <* string ")" <* lineEnd)
-                                    <|> string "/V /" *> commit (takeCharsWhile (`notElem` ['\r', '\n']) <* lineEnd)
-                                    <?> "value"))
+  <*> optional (strictText $
+                admit (string "/V ("
+                       *> commit (concatMany (takeCharsWhile1 (`notElem` [')', '\r', '\n', '\\']) <|> escape)
+                                  <* string ")" <* lineEnd)
+                       <|> string "/V /" *> commit (takeCharsWhile (`notElem` ['\r', '\n']) <* lineEnd)
+                       <?> "value"))
   <*> admit (string "/Kids [" *> commit (lineEnd *> takeSome field <* string "]" <* lineEnd <?> "kids")
              <|> commit mempty)
   <* end
+  where escape = char '\\'
+                 *> (char 'n' *> pure "\n"
+                     <|> char 'r' *> pure "\r"
+                     <|> char 't' *> pure "\t"
+                     <|> char 'b' *> pure "\b"
+                     <|> char 'f' *> pure "\f"
+                     <|> char '(' *> pure "("
+                     <|> char ')' *> pure ")"
+                     <|> char '\\' *> pure "\\"
+                     <|> singleton . chr . sum <$> sequenceA [(64 *) <$> octalDigit, (8 *) <$> octalDigit, octalDigit])
+        octalDigit = digitToInt <$> octDigit
 
 begin :: Parser ByteStringUTF8 ByteStringUTF8
 begin = string "<<" *> lineEnd <?> "<<"

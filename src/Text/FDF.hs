@@ -43,7 +43,7 @@ data Field = Field {
   name :: Text,
   value :: Maybe Text,
   kids :: [Field]}
-  deriving (Eq, Show)
+  deriving (Eq, Ord, Show)
 
 mapWithKey :: ([Text] -> Text -> Text) -> FDF -> FDF
 mapWithKey f x@FDF{body} = x{body = mapFieldWithKey f body}

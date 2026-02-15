@@ -12,7 +12,7 @@
 
 module Main (main) where
 
-import Control.Applicative ((<|>), many)
+import Control.Applicative ((<|>), some)
 import Control.Monad (unless, when)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as ByteString
@@ -33,22 +33,26 @@ data Difference
   deriving (Eq, Read, Show)
 
 data Options = Options {
+  ignore :: [Text],
+  oldPaths :: Bool,
   old :: FilePath,
   new :: FilePath,
-  verbose :: Bool,
-  ignore :: [Text],
-  oldPaths :: Bool}
+  verbose :: Bool}
 
 optionsParser :: OptsAp.Parser Options
 optionsParser =
-   Options
-   <$> OptsAp.strArgument (OptsAp.metavar "<old form file input>")
-   <*> OptsAp.strArgument (OptsAp.metavar "<new form file input>")
-   <*> OptsAp.switch (OptsAp.short 'v' <> OptsAp.long "verbose" <> OptsAp.help "also diff fields with empty values")
-   <*> many (OptsAp.strOption (OptsAp.short 'i' <> OptsAp.long "ignore" <> OptsAp.metavar "<name to ignore>"
+  (
+    Options
+    <$> some (OptsAp.strOption (OptsAp.short 'i' <> OptsAp.long "ignore" <> OptsAp.metavar "<name to ignore>"
                                 <> OptsAp.help "ignore the named difference in the field path"))
-   <*> (OptsAp.flag' True (OptsAp.long "old" <> OptsAp.help "emit field paths from the old FDF")
-        <|> OptsAp.flag' False (OptsAp.long "new" <> OptsAp.help "emit field paths from the new FDF"))
+    <*> (OptsAp.flag' True (OptsAp.long "old" <> OptsAp.help "emit field paths from the old FDF")
+         <|> OptsAp.flag' False (OptsAp.long "new" <> OptsAp.help "emit field paths from the new FDF"))
+    <|>
+    pure (Options [] True)
+  )
+  <*> OptsAp.strArgument (OptsAp.metavar "<old form file input>")
+  <*> OptsAp.strArgument (OptsAp.metavar "<new form file input>")
+  <*> OptsAp.switch (OptsAp.short 'v' <> OptsAp.long "verbose" <> OptsAp.help "also diff fields with empty values")
 
 readFDF :: FilePath -> IO FDF
 readFDF inputPath = do

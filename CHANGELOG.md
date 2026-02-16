@@ -15,3 +15,8 @@
 ## 0.2.1 -- 2024-02-29
 
 * Properly parse and serialize special and Unicode characters
+
+## 0.3 -- 2025-02-15
+
+* Changed the `Field` data type, as it appears to never have a value and children at the same time
+* Added executables `fdfdiff` and `fdfpatch`

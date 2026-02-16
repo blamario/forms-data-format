@@ -41,3 +41,10 @@ executable fdfdiff
     build-depends:    base == 4.*, bytestring, text,
                       directory >= 1.2 && < 1.4, optparse-applicative >= 0.15 && < 0.19,
                       forms-data-format
+
+executable fdfpatch
+    main-is:          Patch.hs
+    hs-source-dirs:   app
+    build-depends:    base == 4.*, bytestring, text,
+                      directory >= 1.2 && < 1.4, optparse-applicative >= 0.15 && < 0.19,
+                      forms-data-format

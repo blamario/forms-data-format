@@ -37,6 +37,7 @@ library
 
 executable fdfdiff
     main-is:          Diff.hs
+    other-modules:    Common
     hs-source-dirs:   app
     build-depends:    base == 4.*, bytestring, text,
                       directory >= 1.2 && < 1.4, optparse-applicative >= 0.15 && < 0.19,
@@ -44,6 +45,7 @@ executable fdfdiff
 
 executable fdfpatch
     main-is:          Patch.hs
+    other-modules:    Common
     hs-source-dirs:   app
     build-depends:    base == 4.*, bytestring, text,
                       directory >= 1.2 && < 1.4, optparse-applicative >= 0.15 && < 0.19,

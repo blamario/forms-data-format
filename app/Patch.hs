@@ -12,12 +12,8 @@
 
 module Main (main) where
 
-import Control.Applicative (many)
-import Control.Monad (unless, when)
 import Data.Bifunctor (first)
 import Data.ByteString qualified as ByteString
-import Data.Foldable (fold, traverse_)
-import Data.List qualified as List
 import Data.List.NonEmpty (NonEmpty)
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Semigroup (Endo(..))
@@ -25,38 +21,21 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text.IO
 import Options.Applicative qualified as OptsAp
-import System.Directory (doesFileExist)
+
 import Text.FDF (FDF)
 import Text.FDF qualified as FDF
+import Common (Difference(Deletion, Addition, Change), readFDF)
 
-data Difference
-  = Deletion Text
-  | Addition Text
-  | Change Text Text
-  deriving (Eq, Read, Show)
 
 data Options = Options {
-  ignore :: [Text],
   diff :: FilePath,
   input :: FilePath}
 
 optionsParser :: OptsAp.Parser Options
 optionsParser =
   Options
-  <$> many (OptsAp.strOption (OptsAp.short 'i' <> OptsAp.long "ignore" <> OptsAp.metavar "<name to ignore>"
-                              <> OptsAp.help "ignore the named difference in the field path"))
-  <*> OptsAp.strArgument (OptsAp.metavar "<diff file input>")
+  <$> OptsAp.strArgument (OptsAp.metavar "<diff file input>")
   <*> OptsAp.strArgument (OptsAp.metavar "<form file input>")
-
-readFDF :: FilePath -> IO FDF
-readFDF inputPath = do
-   exists <- doesFileExist inputPath
-   unless (inputPath == "-" || exists) (error $ "Input file " <> show inputPath <> " doesn't exist.")
-   content <- if inputPath == "-" then ByteString.getContents else ByteString.readFile inputPath
-   case FDF.parse content of
-     Left err -> error ((if inputPath == "-" then "Standard input" else "File " <> inputPath)
-                        <> " is not valid FDF:\n" <> err)
-     Right fdf -> pure fdf
 
 parseLine :: Text -> ([Text], Difference)
 parseLine line = case Text.splitAt 2 line of

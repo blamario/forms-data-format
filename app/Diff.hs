@@ -1,5 +1,3 @@
-{-# LANGUAGE Haskell2010, ImportQualifiedPost, OverloadedRecordDot, OverloadedStrings, NoFieldSelectors  #-}
-
 -- | Outputs the difference of two input FDF files in the following format:
 --
 -- output = (line "\n")*
@@ -10,27 +8,24 @@
 -- name = <any printable character except "/" and "=">*
 -- value = <any printable character except ">">*
 
+{-# LANGUAGE Haskell2010, ImportQualifiedPost, OverloadedRecordDot, OverloadedStrings, NoFieldSelectors  #-}
+
 module Main (main) where
 
 import Control.Applicative ((<|>), some)
-import Control.Monad (unless, when)
+import Control.Monad (when)
 import Data.Bifunctor (first)
-import Data.ByteString qualified as ByteString
-import Data.Foldable (fold, traverse_)
+import Data.Foldable (traverse_)
 import Data.List qualified as List
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text.IO
 import Options.Applicative qualified as OptsAp
-import System.Directory (doesFileExist)
+
 import Text.FDF (FDF)
 import Text.FDF qualified as FDF
+import Common (Difference(Deletion, Addition, Change), readFDF)
 
-data Difference
-  = Deletion Text
-  | Addition Text
-  | Change Text Text
-  deriving (Eq, Read, Show)
 
 data Options = Options {
   ignore :: [Text],
@@ -53,16 +48,6 @@ optionsParser =
   <*> OptsAp.strArgument (OptsAp.metavar "<old form file input>")
   <*> OptsAp.strArgument (OptsAp.metavar "<new form file input>")
   <*> OptsAp.switch (OptsAp.short 'v' <> OptsAp.long "verbose" <> OptsAp.help "also diff fields with empty values")
-
-readFDF :: FilePath -> IO FDF
-readFDF inputPath = do
-   exists <- doesFileExist inputPath
-   unless (inputPath == "-" || exists) (error $ "Input file " <> show inputPath <> " doesn't exist.")
-   content <- if inputPath == "-" then ByteString.getContents else ByteString.readFile inputPath
-   case FDF.parse content of
-     Left err -> error ((if inputPath == "-" then "Standard input" else "File " <> inputPath)
-                        <> " is not valid FDF:\n" <> err)
-     Right fdf -> pure fdf
 
 diffLine :: ([Text], Difference) -> Text
 diffLine (path, Deletion value) = "< " <> Text.intercalate "/" path <> "=" <> value

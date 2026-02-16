@@ -5,7 +5,8 @@
 
 -- | Parse and serialize between FDF files and `Map [Text] Text`.
 
-module Text.FDF (FDF (FDF, body), Field (Field, name, value, kids),
+module Text.FDF (FDF (FDF, body), Field (Field, name, content), FieldContent (FieldValue, Children),
+                 insert, delete, update,
                  mapWithKey, mapFieldWithKey,
                  foldMapWithKey, foldMapFieldWithKey,
                  traverseWithKey, traverseFieldWithKey,
@@ -16,6 +17,7 @@ import Data.Bifunctor (bimap)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.Char (chr, digitToInt, isAscii, isSpace, ord)
+import Data.List.NonEmpty (NonEmpty((:|)), nonEmpty)
 import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
 import Data.Monoid.Textual (singleton, toString, toText)
 import Data.Text (Text)
@@ -40,32 +42,102 @@ data FDF = FDF {
 
 -- | The body of FDF is a tree of nestable 'Field's.
 data Field = Field {
-  name :: Text,
-  value :: Maybe Text,
-  kids :: [Field]}
+    name :: Text,
+    content :: FieldContent}
   deriving (Eq, Ord, Show)
+
+data FieldContent
+  = FieldValue Text
+  | Children [Field]
+  deriving (Show, Eq, Ord)
+
+-- | Insert a value at a new path into the FDF
+insert :: NonEmpty Text -> Text -> FDF -> FDF
+insert key value x@FDF{body} = x{body = insertField key value body}
+
+-- | Delete an existing field at the given path from the FDF
+delete :: NonEmpty Text -> Text -> FDF -> FDF
+delete key old x@FDF{body} = x{body = deleteField key old body}
+
+-- | Update a value at a new path into the FDF
+update :: NonEmpty Text -> Text -> Text -> FDF -> FDF
+update key old new x@FDF{body} = x{body = updateField key old new body}
+
+insertField :: NonEmpty Text -> Text -> Field -> Field
+insertField (root :| path) new x@Field{name, content}
+  | root /= name = error ("Insertion name mismatch: " <> show root <> "/=" <> show name)
+  | otherwise = case nonEmpty path of
+      Nothing
+        | FieldValue old <- content -> error ("Insertion would overwrite value: " <> show old <> "->" <> show new)
+        | otherwise -> error ("Insertion would prune " <> show root)
+      Just path' -> case content of
+        FieldValue old -> error ("Insertion ran out " <> show (root : path))
+        Children kids -> x{content= Children $ insertAmong path' new kids}
+
+deleteField :: NonEmpty Text -> Text -> Field -> Field
+deleteField (root :| path) old x@Field{name, content}
+  | root /= name = error ("Deletion name mismatch: " <> show root <> "/=" <> show name)
+  | otherwise = case nonEmpty path of
+      Nothing
+        | Children{} <- content -> error ("Deletion would prune " <> show root)
+        | content /= FieldValue old -> error ("Expected to delete " <> show old <> ", instead found " <> show content)
+      Just path'
+        | Children kids <- content -> x{content= Children $ deleteAmong path' old kids}
+        | otherwise -> error ("Deletion ran out " <> show root)
+
+updateField :: NonEmpty Text -> Text -> Text -> Field -> Field
+updateField (root :| path) old new x@Field{name, content}
+  | root /= name = error ("Update name mismatch: " <> show root <> "/=" <> show name)
+  | otherwise = case nonEmpty path of
+      Nothing
+        | content /= FieldValue old -> error ("Expected to update " <> show old <> ", instead found " <> show content)
+        | otherwise -> x{content= FieldValue new}
+      Just path'
+        | Children kids <- content -> x{content= Children $ updateAmong path' old new kids}
+
+insertAmong :: NonEmpty Text -> Text -> [Field] -> [Field]
+insertAmong path@(root :| _) new (x@Field{name} : xs)
+  | root == name = insertField path new x : xs
+  | otherwise = x : insertAmong path new xs
+insertAmong (root :| path) new [] = case nonEmpty path of
+  Nothing -> [Field{name=root, content = FieldValue new}]
+  Just path' ->[Field{name=root, content = Children $ insertAmong path' new []}]
+
+deleteAmong :: NonEmpty Text -> Text -> [Field] -> [Field]
+deleteAmong path@(root :| rest) old (x@Field{name, content} : xs)
+  | root /= name = x : deleteAmong path old xs
+  | Just path' <- nonEmpty rest = deleteField path' old x : xs
+  | content /= FieldValue old = error ("Expected to delete " <> show old <> ", instead found " <> show content)
+  | otherwise = xs
+deleteAmong path _ [] = error ("Can't find the path to delete, " <> show path)
+
+updateAmong :: NonEmpty Text -> Text -> Text -> [Field] -> [Field]
+updateAmong path@(root :| _) old new (x@Field{name} : xs)
+  | root == name = updateField path old new x : xs
+  | otherwise = x : updateAmong path old new xs
+updateAmong path _ _ [] = error ("Can't find the path to update, " <> show path)
 
 mapWithKey :: ([Text] -> Text -> Text) -> FDF -> FDF
 mapWithKey f x@FDF{body} = x{body = mapFieldWithKey f body}
 
 mapFieldWithKey :: ([Text] -> Text -> Text) -> Field -> Field
-mapFieldWithKey f x@Field{name, value, kids} =
-  x{value = f [name] <$> value,
-    kids = mapFieldWithKey (f . (name:)) <$> kids}
+mapFieldWithKey f x@Field{name, content=FieldValue v} = x{content = FieldValue $ f [name] v}
+mapFieldWithKey f x@Field{name, content=Children kids} = x{content = Children $ mapFieldWithKey (f . (name:)) <$> kids}
 
 foldMapWithKey :: Monoid a => ([Text] -> Text -> a) -> FDF -> a
 foldMapWithKey f x@FDF{body} = foldMapFieldWithKey f body
 
 foldMapFieldWithKey :: Monoid a => ([Text] -> Text -> a) -> Field -> a
-foldMapFieldWithKey f x@Field{name, value, kids} =
-  foldMap (f [name]) value <> foldMap (foldMapFieldWithKey $ f . (name:)) kids
+foldMapFieldWithKey f Field{name, content = FieldValue v} = f [name] v
+foldMapFieldWithKey f Field{name, content = Children kids} = foldMap (foldMapFieldWithKey $ f . (name:)) kids
 
 traverseWithKey :: Applicative f => ([Text] -> Text -> f Text) -> FDF -> f FDF
 traverseWithKey f x@FDF{body} = (\body'-> x{body = body'}) <$> traverseFieldWithKey f body
 
 traverseFieldWithKey :: Applicative f => ([Text] -> Text -> f Text) -> Field -> f Field
-traverseFieldWithKey f x@Field{name, value, kids} =
-  Field name <$> traverse (f [name]) value <*> traverse (traverseFieldWithKey $ f . (name:)) kids
+traverseFieldWithKey f Field{name, content = FieldValue v} = Field name . FieldValue <$> f [name] v
+traverseFieldWithKey f Field{name, content = Children kids} =
+  Field name . Children <$> traverse (traverseFieldWithKey $ f . (name:)) kids
 
 serialize :: FDF -> ByteString
 serialize FDF{header, body, trailer} =
@@ -83,10 +155,14 @@ serialize FDF{header, body, trailer} =
   <> "%%EOF\n"
 
 serializeField :: Field -> ByteString
-serializeField Field{name, value, kids} =
+serializeField Field{name, content = FieldValue v} =
   "<<\n"
   <> "/T (" <> encodeUtf8 name <> ")\n"
-  <> foldMap (\v-> "/V (" <> serializeValue v <> ")\n") value
+  <> "/V (" <> serializeValue v <> ")\n"
+  <> ">>"
+serializeField Field{name, content = Children kids} =
+  "<<\n"
+  <> "/T (" <> encodeUtf8 name <> ")\n"
   <> (if null kids then "" else "/Kids [\n" <> ByteString.intercalate "\n" (serializeField <$> kids) <> "]\n")
   <> ">>"
 
@@ -134,28 +210,30 @@ parser = FDF
 field :: Parser ByteStringUTF8 Field
 field = Field <$ begin
   <*> strictText (string "/T (" *> takeCharsWhile (`notElem` [')', '\r', '\n']) <* string ")" <* lineEnd <?> "name")
-  <*> optional (strictText $
-                admit (string "/V ("
-                       *> commit ((string (ByteStringUTF8 utf16beBOM) *> (utf8from16 <$> Text.Grampa.takeWhile (/= ")"))
-                                   <|> concatMany (takeCharsWhile1 (`notElem` [')', '\r', '\n', '\\']) <|> escape))
-                                  <* string ")" <* lineEnd)
-                       <|> string "/V /" *> commit (takeCharsWhile (`notElem` ['\r', '\n']) <* lineEnd)
-                       <?> "value"))
-  <*> admit (string "/Kids [" *> commit (lineEnd *> takeSome field <* string "]" <* lineEnd <?> "kids")
-             <|> commit mempty)
+  <*> (FieldValue <$> fieldValue <|> Children <$> children)
   <* end
-  where escape = char '\\'
-                 *> (singleton <$> (char 'n' *> pure '\n'
-                                    <|> char 'r' *> pure '\r'
-                                    <|> char 't' *> pure '\t'
-                                    <|> char 'b' *> pure '\b'
-                                    <|> char 'f' *> pure '\f'
-                                    <|> char '(' *> pure '('
-                                    <|> char ')' *> pure ')'
-                                    <|> char '\\' *> pure '\\'
-                                    <|> chr . sum <$> sequenceA [(64 *) <$> octalDigit, (8 *) <$> octalDigit, octalDigit]))
-        octalDigit = digitToInt <$> octDigit
-        utf8from16 (ByteStringUTF8 bs) = ByteStringUTF8 (encodeUtf8 $ decodeUtf16BE bs)
+  where
+    fieldValue = strictText $
+                 admit (string "/V ("
+                        *> commit ((string (ByteStringUTF8 utf16beBOM) *> (utf8from16 <$> Text.Grampa.takeWhile (/= ")"))
+                                    <|> concatMany (takeCharsWhile1 (`notElem` [')', '\r', '\n', '\\']) <|> escape))
+                                   <* string ")" <* lineEnd)
+                        <|> string "/V /" *> commit (takeCharsWhile (`notElem` ['\r', '\n']) <* lineEnd)
+                        <?> "value")
+    children = admit (string "/Kids [" *> commit (lineEnd *> takeSome field <* string "]" <* lineEnd <?> "kids")
+                      <|> commit mempty)
+    escape = char '\\'
+             *> (singleton <$> (char 'n' *> pure '\n'
+                                <|> char 'r' *> pure '\r'
+                                <|> char 't' *> pure '\t'
+                                <|> char 'b' *> pure '\b'
+                                <|> char 'f' *> pure '\f'
+                                <|> char '(' *> pure '('
+                                <|> char ')' *> pure ')'
+                                <|> char '\\' *> pure '\\'
+                                <|> chr . sum <$> sequenceA [(64 *) <$> octalDigit, (8 *) <$> octalDigit, octalDigit]))
+    octalDigit = digitToInt <$> octDigit
+    utf8from16 (ByteStringUTF8 bs) = ByteStringUTF8 (encodeUtf8 $ decodeUtf16BE bs)
 
 begin :: Parser ByteStringUTF8 ByteStringUTF8
 begin = string "<<" *> lineEnd <?> "<<"

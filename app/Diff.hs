@@ -1,10 +1,10 @@
-{-# LANGUAGE Haskell2010, OverloadedRecordDot, OverloadedStrings, NoFieldSelectors  #-}
+{-# LANGUAGE Haskell2010, ImportQualifiedPost, OverloadedRecordDot, OverloadedStrings, NoFieldSelectors  #-}
 
 -- | Outputs the difference of two input FDF files in the following format:
 --
 -- output = (line "\n")*
--- line = "< " path ("=" value)?
---      | "> " path ("=" value)?
+-- line = "< " path "=" value
+--      | "> " path "=" value
 --      | "! " path ": " value "->" value
 -- path = name ("/" name)*
 -- name = <any printable character except "/" and "=">*
@@ -15,21 +15,21 @@ module Main (main) where
 import Control.Applicative ((<|>), some)
 import Control.Monad (unless, when)
 import Data.Bifunctor (first)
-import qualified Data.ByteString as ByteString
+import Data.ByteString qualified as ByteString
 import Data.Foldable (fold, traverse_)
-import qualified Data.List as List
+import Data.List qualified as List
 import Data.Text (Text)
-import qualified Data.Text as Text
-import qualified Data.Text.IO as Text.IO
-import qualified Options.Applicative as OptsAp
+import Data.Text qualified as Text
+import Data.Text.IO qualified as Text.IO
+import Options.Applicative qualified as OptsAp
 import System.Directory (doesFileExist)
 import Text.FDF (FDF)
-import qualified Text.FDF as FDF
+import Text.FDF qualified as FDF
 
 data Difference
-  = Deletion (Maybe Text)
-  | Addition (Maybe Text)
-  | Change (Maybe Text) (Maybe Text)
+  = Deletion Text
+  | Addition Text
+  | Change Text Text
   deriving (Eq, Read, Show)
 
 data Options = Options {
@@ -65,48 +65,59 @@ readFDF inputPath = do
      Right fdf -> pure fdf
 
 diffLine :: ([Text], Difference) -> Text
-diffLine (path, Deletion value) = "< " <> Text.intercalate "/" path <> foldMap ("=" <>) value
-diffLine (path, Addition value) = "> " <> Text.intercalate "/" path <> foldMap ("=" <>) value
-diffLine (path, Change old new) = "! " <> Text.intercalate "/" path <> ": " <> fold old <> "->" <> fold new
+diffLine (path, Deletion value) = "< " <> Text.intercalate "/" path <> "=" <> value
+diffLine (path, Addition value) = "> " <> Text.intercalate "/" path <> "=" <> value
+diffLine (path, Change old new) = "! " <> Text.intercalate "/" path <> ": " <> old <> "->" <> new
 
 diff :: Bool -> (Text -> Bool) -> [Text] -> FDF.Field -> FDF.Field -> [([Text], Difference)]
 diff oldPaths ignorable ancestry old new
   | old.name /= new.name =
     map (Deletion <$>) (list (ancestry ++) old) ++
     map (Addition <$>) (list (ancestry ++) new)
-  | old.value /= new.value =
-    [(ancestry <> [old.name], Change old.value new.value)] <> diffAll oldPaths ignorable ancestry old.kids new.kids
-  | otherwise = diffAll oldPaths ignorable (ancestry <> [old.name]) old.kids new.kids
+  | otherwise = diffContents oldPaths ignorable (ancestry ++ [old.name]) old.content new.content
+
+diffContents :: Bool -> (Text -> Bool) -> [Text] -> FDF.FieldContent -> FDF.FieldContent -> [([Text], Difference)]
+diffContents oldPaths ignorable ancestry (FDF.FieldValue old) (FDF.FieldValue new)
+  | old == new = []
+  | otherwise = [(ancestry, Change old new)]
+diffContents oldPaths ignorable ancestry (FDF.Children old) (FDF.Children new) =
+  diffAll oldPaths ignorable ancestry old new
+diffContents oldPaths ignorable ancestry old new =
+  map (Deletion <$>) (listContent (ancestry ++) old) ++
+  map (Addition <$>) (listContent (ancestry ++) new)
 
 diffAll, diffSorted :: Bool -> (Text -> Bool) -> [Text] -> [FDF.Field] -> [FDF.Field] -> [([Text], Difference)]
 
 diffAll oldPaths ignorable ancestry old new = diffSorted oldPaths ignorable ancestry (List.sort old) (List.sort new)
 
 diffSorted oldPaths ignorable ancestry (old : olds) (new : news)
-  | ignorable old.name, Nothing <- old.value
+  | ignorable old.name, FDF.Children kids <- old.content
   = diffSorted oldPaths ignorable
       (if oldPaths then ancestry ++ [old.name] else ancestry)
-      (List.sort $ old.kids ++ olds)
+      (List.sort $ kids ++ olds)
       (new : news)
-  | ignorable new.name, Nothing <- new.value
+  | ignorable new.name, FDF.Children kids <- new.content
   = diffSorted oldPaths ignorable
       (if oldPaths then ancestry else ancestry ++ [new.name])
       (old : olds)
-      (List.sort $ new.kids ++ news)
+      (List.sort $ kids ++ news)
   | old.name < new.name = map (Deletion <$>) (list (ancestry ++) old) ++ diffSorted oldPaths ignorable ancestry olds (new : news)
   | old.name > new.name = map (Addition <$>) (list (ancestry ++) new) ++ diffSorted oldPaths ignorable ancestry (old : olds) news
   | otherwise = diff oldPaths ignorable ancestry old new <> diffSorted oldPaths ignorable ancestry olds news
 diffSorted _ _ ancestry olds [] = foldMap (map (Deletion <$>) . list (ancestry ++)) olds
 diffSorted _ _ ancestry [] news = foldMap (map (Addition <$>) . list (ancestry ++)) news
 
-list :: ([Text] -> [Text]) -> FDF.Field -> [([Text], Maybe Text)]
-list addAncestry x = (addAncestry [x.name], x.value) : foldMap (list (addAncestry . (x.name :))) (List.sort x.kids)
+list :: ([Text] -> [Text]) -> FDF.Field -> [([Text], Text)]
+list addAncestry x = listContent (addAncestry . (x.name :)) x.content
+
+listContent :: ([Text] -> [Text]) -> FDF.FieldContent -> [([Text], Text)]
+listContent addAncestry (FDF.FieldValue v) = [(addAncestry [], v)]
+listContent addAncestry (FDF.Children kids) = foldMap (list addAncestry) (List.sort kids)
 
 hasNonemptyValue :: Difference -> Bool
-hasNonemptyValue (Deletion (Just v)) = not (Text.null v)
-hasNonemptyValue (Addition (Just v)) = not (Text.null v)
+hasNonemptyValue (Deletion v) = not (Text.null v)
+hasNonemptyValue (Addition v) = not (Text.null v)
 hasNonemptyValue (Change v1 v2) = v1 /= v2
-hasNonemptyValue _ = False
 
 process :: Options -> IO ()
 process options = do

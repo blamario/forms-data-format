@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Conversion between PDF AcroForm fields and FDF format, replacing the need
 -- for the external @pdftk@ tool.
@@ -45,11 +46,13 @@ module Text.FDF.PDF
   , fillPDF
   ) where
 
+import Control.Exception (SomeException, evaluate, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as LBS
+import qualified Codec.Compression.Zlib as Zlib
 import Data.Char (chr, intToDigit, isDigit, isHexDigit, isSpace, ord)
 import Data.Int (Int64)
 import Data.List (foldl')
@@ -60,6 +63,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Word (Word8)
+import System.IO.Unsafe (unsafePerformIO)
 
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
 import qualified Text.FDF as FDF
@@ -70,19 +74,19 @@ import qualified Text.FDF as FDF
 -- | Extract form field data from a PDF file.
 --
 -- Reads the PDF's AcroForm structure and returns the corresponding 'FDF'
--- value.  Supports PDFs with traditional (table-based) cross-reference
--- sections; cross-reference streams (PDF 1.5+) are not yet supported.
+-- value.  Supports both traditional (table-based) cross-reference sections
+-- and cross-reference streams (PDF 1.5+), including FlateDecode-compressed
+-- object streams.
 parsePDF :: ByteString -> Either String FDF
 parsePDF bs = do
-  xrefOff   <- findXRefOffset bs
-  (xref, _) <- parseXRefChain bs xrefOff
-  trailer   <- parseTrailerDict bs xrefOff
-  rootRef   <- dictLookupRef "Root" trailer
-  catalog   <- loadDict bs xref rootRef
-  acroRef   <- dictLookupRef "AcroForm" catalog
-  acroForm  <- loadDict bs xref acroRef
-  fieldsArr <- loadArray bs xref "Fields" acroForm
-  fields    <- mapM (loadFieldObj bs xref) fieldsArr
+  xrefOff         <- findXRefOffset bs
+  (xref, trailer) <- parseXRefChain bs xrefOff
+  rootRef         <- dictLookupRef "Root" trailer
+  catalog         <- loadDict bs xref rootRef
+  acroRef         <- dictLookupRef "AcroForm" catalog
+  acroForm        <- loadDict bs xref acroRef
+  fieldsArr       <- loadArray bs xref "Fields" acroForm
+  fields          <- mapM (loadFieldObj bs xref) fieldsArr
   case fields of
     []  -> Left "PDF has no AcroForm fields"
     [f] -> Right $ FDF
@@ -100,20 +104,19 @@ parsePDF bs = do
 -- Encrypted PDFs are not supported.
 fillPDF :: FDF -> ByteString -> Either String ByteString
 fillPDF fdf pdfBytes = do
-  xrefOff          <- findXRefOffset pdfBytes
-  (xref, _)        <- parseXRefChain pdfBytes xrefOff
-  trailer          <- parseTrailerDict pdfBytes xrefOff
-  rootRef          <- dictLookupRef "Root" trailer
-  catalog          <- loadDict pdfBytes xref rootRef
-  acroRef          <- dictLookupRef "AcroForm" catalog
-  acroForm         <- loadDict pdfBytes xref acroRef
-  fieldsArr        <- loadArray pdfBytes xref "Fields" acroForm
+  xrefOff         <- findXRefOffset pdfBytes
+  (xref, trailer) <- parseXRefChain pdfBytes xrefOff
+  rootRef         <- dictLookupRef "Root" trailer
+  catalog         <- loadDict pdfBytes xref rootRef
+  acroRef         <- dictLookupRef "AcroForm" catalog
+  acroForm        <- loadDict pdfBytes xref acroRef
+  fieldsArr       <- loadArray pdfBytes xref "Fields" acroForm
   -- Build mapping:  full path → (objNum, current dict)
-  pathMap          <- buildPathMap pdfBytes xref [] fieldsArr
+  pathMap         <- buildPathMap pdfBytes xref [] fieldsArr
   -- Collect leaf-value updates from FDF
-  let updates       = collectUpdates [] (body fdf)
+  let updates      = collectUpdates [] (body fdf)
   -- Apply updates: produce list of (objNum, new dict)
-  let totalObjs     = fromMaybe 0 $ do
+  let totalObjs    = fromMaybe 0 $ do
         PDFInt n <- Map.lookup "Size" trailer
         return n
   (newObjs, _) <- foldl' (applyUpdate pathMap) (Right ([], totalObjs)) updates
@@ -139,8 +142,14 @@ data PDFValue
 -- ---------------------------------------------------------------------------
 -- XRef
 
--- | Byte offsets for in-use objects, keyed by object number.
-type XRef = Map Int Int64
+-- | A single cross-reference entry.
+data XRefEntry
+  = XRefOffset Int64   -- ^ byte offset of the object in the file
+  | XRefObjStm Int Int -- ^ compressed: (object stream obj number, index in stream)
+  deriving (Eq, Show)
+
+-- | Cross-reference table: maps object number to its location.
+type XRef = Map Int XRefEntry
 
 -- ---------------------------------------------------------------------------
 -- Finding startxref
@@ -186,13 +195,17 @@ parseXRefChain bs off = do
       return (Map.union xref prevXRef, trailer)
     _ -> return (xref, trailer)
 
--- | Parse a single cross-reference table and its trailer dictionary.
+-- | Parse a single cross-reference section (either traditional table or
+-- cross-reference stream) and return the XRef map plus trailer dictionary.
 parseOneXRef :: ByteString -> Int64 -> Either String (XRef, Map ByteString PDFValue)
 parseOneXRef bs off = do
   let chunk = BS.drop (fromIntegral off) bs
   if "xref" `BS.isPrefixOf` chunk
     then parseTraditionalXRef chunk
-    else Left "Cross-reference streams (PDF 1.5+) are not yet supported"
+    else parseXRefStream bs off
+
+-- ---------------------------------------------------------------------------
+-- Traditional (table-based) cross-reference section
 
 -- | Parse a traditional (table-based) cross-reference section and its trailer.
 parseTraditionalXRef :: ByteString -> Either String (XRef, Map ByteString PDFValue)
@@ -225,49 +238,159 @@ parseSubsection bs0 = do
   let count   = readDecimal countStr
       r3      = dropLineEnd r2
       entries = Map.fromList
-                  [ (firstObj + i, parseXRefEntry (BS.take 20 (BS.drop (i * 20) r3)))
+                  [ (firstObj + i, e)
                   | i <- [0 .. count - 1]
+                  , Just e <- [parseXRefEntry (BS.take 20 (BS.drop (i * 20) r3))]
                   ]
-  Right (BS.drop (count * 20) r3, Map.filter (>= 0) entries)
+  Right (BS.drop (count * 20) r3, entries)
 
--- | Parse one 20-byte xref entry.  Returns the byte offset, or -1 for free
--- entries.
-parseXRefEntry :: ByteString -> Int64
+-- | Parse one 20-byte xref entry.  Returns 'Nothing' for free entries.
+parseXRefEntry :: ByteString -> Maybe XRefEntry
 parseXRefEntry entry
-  | BS.length entry >= 18 && BSC.index entry 17 == 'f' = -1
-  | otherwise = fromIntegral (readDecimal (BS.take 10 entry))
+  | BS.length entry >= 18 && BSC.index entry 17 == 'f' = Nothing
+  | otherwise = Just (XRefOffset (fromIntegral (readDecimal (BS.take 10 entry))))
 
 -- ---------------------------------------------------------------------------
--- Trailer dictionary helpers
+-- Cross-reference stream (PDF 1.5+)
 
--- | Parse the trailer dictionary at the given xref offset.
-parseTrailerDict :: ByteString -> Int64 -> Either String (Map ByteString PDFValue)
-parseTrailerDict bs xrefOff = do
-  let chunk = BS.drop (fromIntegral xrefOff) bs
-  -- Find "trailer" keyword inside the chunk
-  case findFirst "trailer" chunk of
-    Nothing -> Left "Cannot find 'trailer' keyword"
-    Just off ->
-      let afterTrailer = dropWS (BS.drop (off + 7) chunk)
-      in case parseDict afterTrailer of
-           Left err      -> Left ("Trailer dict parse error: " <> err)
-           Right (td, _) -> Right td
+-- | Parse a cross-reference stream at the given byte offset.
+-- The xref stream dictionary doubles as the trailer dictionary.
+parseXRefStream :: ByteString -> Int64 -> Either String (XRef, Map ByteString PDFValue)
+parseXRefStream bs off = do
+  (dict, rawBytes) <- parseStreamAt bs off
+  -- Decompress stream data if needed.
+  streamBytes <- decompressStream dict rawBytes
+  -- /W field: widths (in bytes) of the three entry fields.
+  wArr <- case Map.lookup "W" dict of
+    Just (PDFArray ws) -> Right ws
+    _ -> Left "XRef stream missing /W"
+  ws <- mapM toInt wArr
+  case ws of
+    [w1, w2, w3] -> do
+      -- /Size: total number of object slots.
+      size <- toInt =<< maybe (Left "XRef stream missing /Size") Right (Map.lookup "Size" dict)
+      -- /Index: subsection pairs [firstObj count ...]; default is [0 /Size].
+      let subsections = case Map.lookup "Index" dict of
+                          Just (PDFArray idxArr) -> pairsOf idxArr
+                          _                      -> [(0, size)]
+      let xref = parseXRefStreamEntries w1 w2 w3 subsections streamBytes
+      return (xref, dict)
+    _ -> Left ("/W in XRef stream must have exactly 3 elements, got " <> show (length ws))
 
-findFirst :: ByteString -> ByteString -> Maybe Int
-findFirst needle haystack
-  | BS.null haystack          = Nothing
-  | needle `BS.isPrefixOf` haystack = Just 0
-  | otherwise                 = (+ 1) <$> findFirst needle (BS.tail haystack)
+-- | Convert a list of PDFValues into pairs of Ints, used to decode the
+-- /Index array.
+pairsOf :: [PDFValue] -> [(Int, Int)]
+pairsOf (PDFInt a : PDFInt b : rest) = (a, b) : pairsOf rest
+pairsOf _                            = []
+
+-- | Parse all entries from a cross-reference stream.
+parseXRefStreamEntries
+  :: Int            -- ^ w1: width of type field (bytes)
+  -> Int            -- ^ w2: width of field 2 (bytes)
+  -> Int            -- ^ w3: width of field 3 (bytes)
+  -> [(Int, Int)]   -- ^ subsections as (firstObj, count) pairs
+  -> ByteString     -- ^ decompressed stream bytes
+  -> XRef
+parseXRefStreamEntries w1 w2 w3 subsections streamBytes =
+  go 0 subsections Map.empty
+  where
+    entrySize = w1 + w2 + w3
+    go _   []                        acc = acc
+    go pos ((firstObj, count) : rest) acc =
+      let newEntries =
+            [ case readBEBytes w1 entryBytes of
+                0 -> Nothing   -- free
+                1 -> Just (firstObj + i,
+                           XRefOffset (fromIntegral (readBEBytes w2 (BS.drop w1 entryBytes))))
+                2 -> Just (firstObj + i,
+                           XRefObjStm (readBEBytes w2 (BS.drop w1 entryBytes))
+                                      (readBEBytes w3 (BS.drop (w1 + w2) entryBytes)))
+                _ -> Nothing   -- unknown type, skip
+            | i <- [0 .. count - 1]
+            , let entryBytes = BS.drop (pos + i * entrySize) streamBytes
+            ]
+          acc' = foldl' insertEntry acc newEntries
+      in go (pos + count * entrySize) rest acc'
+    insertEntry m Nothing       = m
+    insertEntry m (Just (k, v)) = Map.insert k v m
+
+-- | Read @n@ bytes as a big-endian unsigned integer.
+readBEBytes :: Int -> ByteString -> Int
+readBEBytes n bs = BS.foldl' (\acc b -> acc * 256 + fromIntegral b) 0 (BS.take n bs)
+
+-- | Convert a 'PDFValue' to an 'Int', failing with a message otherwise.
+toInt :: PDFValue -> Either String Int
+toInt (PDFInt n) = Right n
+toInt v          = Left $ "Expected integer, got: " <> show v
+
+-- ---------------------------------------------------------------------------
+-- Stream parsing and decompression
+
+-- | Parse an indirect stream object at the given byte offset in the file.
+-- Returns the stream dictionary and the raw (possibly compressed) stream bytes.
+parseStreamAt :: ByteString -> Int64 -> Either String (Map ByteString PDFValue, ByteString)
+parseStreamAt bs off = do
+  let chunk = dropWS (BS.drop (fromIntegral off) bs)
+  -- Skip "N G obj"
+  let (_, r1) = BSC.span isDigit chunk
+      (_, r2) = BSC.span isDigit (dropWS r1)
+      r3      = dropWS r2
+  after <- case BSC.stripPrefix "obj" r3 of
+    Just r  -> Right (dropWS r)
+    Nothing -> Left ("Expected 'obj' at offset " <> show off)
+  (dict, rest) <- parseDict after
+  -- The next token should be "stream".
+  let rest' = dropWS rest
+  case BS.stripPrefix "stream" rest' of
+    Nothing       -> Left ("Expected 'stream' keyword at offset " <> show off)
+    Just afterKW  -> do
+      -- Skip exactly one EOL (CR, LF, or CRLF) after the keyword.
+      let streamStart = case BSC.uncons afterKW of
+            Just ('\r', r) -> case BSC.uncons r of
+                                Just ('\n', r') -> r'
+                                _               -> r
+            Just ('\n', r) -> r
+            _              -> afterKW
+      -- /Length must be a direct integer in xref streams; may be indirect
+      -- in object streams (resolved after xref is built, see loadFromObjStream).
+      len <- case Map.lookup "Length" dict of
+               Just (PDFInt n) -> Right n
+               Just _          -> Left "Stream /Length is not a direct integer"
+               Nothing         -> Left "Stream dict missing /Length"
+      Right (dict, BS.take len streamStart)
+
+-- | Decompress stream bytes according to the /Filter entry in the stream dict.
+-- Only /FlateDecode (zlib) is currently supported; other filters return an
+-- error.  If there is no /Filter, the bytes are returned unchanged.
+decompressStream :: Map ByteString PDFValue -> ByteString -> Either String ByteString
+decompressStream dict rawBytes =
+  case Map.lookup "Filter" dict of
+    Nothing                                 -> Right rawBytes
+    Just (PDFName "FlateDecode")            -> zlibDecompress rawBytes
+    Just (PDFArray [PDFName "FlateDecode"]) -> zlibDecompress rawBytes
+    Just f -> Left ("Unsupported stream filter: " <> show f)
+  where
+    -- 'Zlib.decompress' operates on lazy ByteStrings and throws a
+    -- 'DecompressError' exception on invalid data.  We catch it inside
+    -- 'unsafePerformIO' so the rest of the module can stay in Either.
+    -- This is referentially transparent: the same compressed bytes always
+    -- produce the same result (or the same error).
+    zlibDecompress bs = unsafePerformIO $ do
+      result <- try (evaluate (LBS.toStrict (Zlib.decompress (LBS.fromStrict bs))))
+      return $ case (result :: Either SomeException ByteString) of
+        Right decompressed -> Right decompressed
+        Left  e            -> Left ("Stream decompression error: " <> show e)
 
 -- ---------------------------------------------------------------------------
 -- Object loading
 
 -- | Load and dereference an object.  References are followed one level deep.
 loadObject :: ByteString -> XRef -> PDFValue -> Either String PDFValue
-loadObject bs xref (PDFRef n _) = do
-  off <- maybe (Left $ "Object " <> show n <> " not in xref") Right
-               (Map.lookup n xref)
-  parseIndirectObject bs off
+loadObject bs xref (PDFRef n _) =
+  case Map.lookup n xref of
+    Nothing                 -> Left $ "Object " <> show n <> " not in xref"
+    Just (XRefOffset off)   -> parseIndirectObject bs off
+    Just (XRefObjStm sn ix) -> loadFromObjStream bs xref sn ix
 loadObject _ _ v = Right v
 
 -- | Load an object that must be a dictionary.
@@ -290,6 +413,81 @@ parseIndirectObject bs off = do
     Just r  -> Right (dropWS r)
     Nothing -> Left ("Expected 'obj' at offset " <> show off)
   fst <$> parseValue after
+
+-- | Load an object stored inside an object stream.
+-- @stmObjNum@ is the object number of the ObjStm; @idx@ is the 0-based index
+-- of the desired object within that stream.
+loadFromObjStream :: ByteString -> XRef -> Int -> Int -> Either String PDFValue
+loadFromObjStream bs xref stmObjNum idx = do
+  stmOff <- case Map.lookup stmObjNum xref of
+    Just (XRefOffset off) -> Right off
+    Just (XRefObjStm _ _) -> Left "Object stream is itself compressed (not supported)"
+    Nothing               -> Left $ "Object stream " <> show stmObjNum <> " not in xref"
+  -- Parse the stream, resolving /Length via the xref if it's indirect.
+  (rawDict, rawBytes) <- parseStreamAtIndirectLen bs xref stmOff
+  streamBytes         <- decompressStream rawDict rawBytes
+  -- /N: number of objects; /First: byte offset of first object in body.
+  n     <- toInt =<< maybe (Left "ObjStm missing /N")     Right (Map.lookup "N"     rawDict)
+  first <- toInt =<< maybe (Left "ObjStm missing /First") Right (Map.lookup "First" rawDict)
+  -- The header is a flat list of (objNum offset) pairs.
+  offsets <- parseObjStmHeader (BS.take first streamBytes) n
+  (_, relOff) <-
+    case drop idx offsets of
+      (entry : _) -> Right entry
+      []          -> Left $ "Object stream index " <> show idx <> " out of range (n=" <> show n <> ")"
+  let body = BS.drop (first + relOff) streamBytes
+  fst <$> parseValue (dropWS body)
+
+-- | Like 'parseStreamAt' but resolves an indirect /Length reference.
+parseStreamAtIndirectLen
+  :: ByteString
+  -> XRef
+  -> Int64
+  -> Either String (Map ByteString PDFValue, ByteString)
+parseStreamAtIndirectLen bs xref off = do
+  let chunk = dropWS (BS.drop (fromIntegral off) bs)
+  let (_, r1) = BSC.span isDigit chunk
+      (_, r2) = BSC.span isDigit (dropWS r1)
+      r3      = dropWS r2
+  after <- case BSC.stripPrefix "obj" r3 of
+    Just r  -> Right (dropWS r)
+    Nothing -> Left ("Expected 'obj' at offset " <> show off)
+  (dict0, rest) <- parseDict after
+  -- Resolve indirect /Length if necessary.
+  dict <- case Map.lookup "Length" dict0 of
+    Just (PDFRef ln lg) -> do
+      lenVal <- loadObject bs xref (PDFRef ln lg)
+      case lenVal of
+        PDFInt n -> Right (Map.insert "Length" (PDFInt n) dict0)
+        _        -> Left "Resolved /Length is not an integer"
+    _ -> Right dict0
+  let rest' = dropWS rest
+  case BS.stripPrefix "stream" rest' of
+    Nothing      -> Left ("Expected 'stream' keyword at offset " <> show off)
+    Just afterKW -> do
+      let streamStart = case BSC.uncons afterKW of
+            Just ('\r', r) -> case BSC.uncons r of
+                                Just ('\n', r') -> r'
+                                _               -> r
+            Just ('\n', r) -> r
+            _              -> afterKW
+      len <- case Map.lookup "Length" dict of
+               Just (PDFInt n) -> Right n
+               _               -> Left "Stream /Length missing or not resolved"
+      Right (dict, BS.take len streamStart)
+
+-- | Parse the object-number/offset header of an object stream.
+-- Returns a list of @(objectNumber, relativeOffset)@ pairs.
+parseObjStmHeader :: ByteString -> Int -> Either String [(Int, Int)]
+parseObjStmHeader bs n = go (dropWS bs) n []
+  where
+    go _   0 acc = Right (reverse acc)
+    go bs' k acc =
+      let (numStr, r1) = BSC.span isDigit bs'
+          (offStr, r2) = BSC.span isDigit (dropWS r1)
+      in if BS.null numStr || BS.null offStr
+         then Left "Truncated object stream header"
+         else go (dropWS r2) (k - 1) ((readDecimal numStr, readDecimal offStr) : acc)
 
 -- ---------------------------------------------------------------------------
 -- AcroForm field loading
@@ -746,13 +944,6 @@ dictLookupRef key d =
   case Map.lookup key d of
     Just (PDFRef n g) -> Right (n, g)
     Just _            -> Left ("/" <> BSC.unpack key <> " is not a reference")
-    Nothing           -> Left ("/" <> BSC.unpack key <> " not found in dict")
-
-dictLookupArray :: ByteString -> Map ByteString PDFValue -> Either String [PDFValue]
-dictLookupArray key d =
-  case Map.lookup key d of
-    Just (PDFArray a) -> Right a
-    Just _            -> Left ("/" <> BSC.unpack key <> " is not an array")
     Nothing           -> Left ("/" <> BSC.unpack key <> " not found in dict")
 
 -- | Look up an array value in a dictionary, following an indirect reference

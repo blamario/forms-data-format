@@ -1,50 +1,44 @@
 {-# LANGUAGE Haskell2010, ImportQualifiedPost, OverloadedStrings #-}
 
 -- | Convert a PDF file with AcroForm fields into an FDF file.
---
--- Usage: pdf-to-fdf <input.pdf> [<output.fdf>]
---
--- If the output path is omitted or @-@, the FDF is written to standard
--- output.
 
 module Main (main) where
 
-import Control.Monad (unless)
 import Data.ByteString qualified as ByteString
-import System.Directory (doesFileExist)
-import System.Environment (getArgs)
-import System.Exit (exitFailure)
-import System.IO (hPutStrLn, stderr)
+import Options.Applicative qualified as OptsAp
 
 import Text.FDF qualified as FDF
 import Text.FDF.PDF (parsePDF)
 
+data Options = Options
+  { input  :: FilePath
+  , output :: FilePath
+  }
+
+optionsParser :: OptsAp.Parser Options
+optionsParser = Options
+  <$> OptsAp.strArgument
+        (OptsAp.metavar "<input.pdf>"
+         <> OptsAp.help "Input PDF file (use - for stdin)")
+  <*> (OptsAp.strArgument
+         (OptsAp.metavar "<output.fdf>"
+          <> OptsAp.help "Output FDF file (default: write to stdout)")
+       OptsAp.<|> pure "-")
+
 main :: IO ()
 main = do
-  args <- getArgs
-  case args of
-    [input]         -> run input "-"
-    [input, output] -> run input output
-    _               -> do
-      hPutStrLn stderr "Usage: pdf-to-fdf <input.pdf> [<output.fdf>]"
-      exitFailure
-
-run :: FilePath -> FilePath -> IO ()
-run inputPath outputPath = do
-  unless (inputPath == "-") $ do
-    exists <- doesFileExist inputPath
-    unless exists $ do
-      hPutStrLn stderr $ "File not found: " <> inputPath
-      exitFailure
-  pdfBytes <- if inputPath == "-"
+  opts <- OptsAp.execParser $
+    OptsAp.info (optionsParser OptsAp.<**> OptsAp.helper)
+      (OptsAp.fullDesc
+       <> OptsAp.progDesc "Extract AcroForm field data from a PDF into an FDF file"
+       <> OptsAp.header "pdf-to-fdf - convert PDF to FDF")
+  pdfBytes <- if input opts == "-"
                 then ByteString.getContents
-                else ByteString.readFile inputPath
+                else ByteString.readFile (input opts)
   case parsePDF pdfBytes of
-    Left err  -> do
-      hPutStrLn stderr $ "Error reading PDF: " <> err
-      exitFailure
+    Left err  -> ioError (userError $ "Error reading PDF: " <> err)
     Right fdf -> do
       let fdfBytes = FDF.serialize fdf
-      if outputPath == "-"
+      if output opts == "-"
         then ByteString.putStr fdfBytes
-        else ByteString.writeFile outputPath fdfBytes
+        else ByteString.writeFile (output opts) fdfBytes

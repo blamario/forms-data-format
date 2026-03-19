@@ -184,16 +184,32 @@ findLast needle haystack = go 0 Nothing
 -- ---------------------------------------------------------------------------
 -- XRef table parsing
 
--- | Parse the full chain of cross-reference tables, following @/Prev@ links.
+-- | Parse the full chain of cross-reference tables, following @/Prev@ and
+-- @/XRefStm@ links.
+--
+-- Hybrid-reference PDFs (created by Adobe Acrobat for backward compatibility)
+-- have a traditional @xref@ table *and* a @/XRefStm@ entry in the trailer
+-- that points to a cross-reference stream containing additional objects.
+-- Both sources are merged, with the main section taking precedence.
 parseXRefChain :: ByteString -> Int64 -> Either String (XRef, Map ByteString PDFValue)
 parseXRefChain bs off = do
   (xref, trailer) <- parseOneXRef bs off
+  -- Merge any /XRefStm cross-reference stream (hybrid-reference PDFs).
+  xref' <- case Map.lookup "XRefStm" trailer of
+              Just (PDFInt stmOff) ->
+                case parseXRefStream bs (fromIntegral stmOff) of
+                  Left err        -> Left ("/XRefStm parse error: " <> err)
+                  Right (stmXref, _) ->
+                    -- Main xref takes precedence over the hybrid stream.
+                    Right (Map.union xref stmXref)
+              _ -> return xref
+  -- Follow the /Prev chain to older xref sections.
   case Map.lookup "Prev" trailer of
     Just (PDFInt prev) -> do
       (prevXRef, _) <- parseXRefChain bs (fromIntegral prev)
       -- Newer (current) entries take precedence over older ones.
-      return (Map.union xref prevXRef, trailer)
-    _ -> return (xref, trailer)
+      return (Map.union xref' prevXRef, trailer)
+    _ -> return (xref', trailer)
 
 -- | Parse a single cross-reference section (either traditional table or
 -- cross-reference stream) and return the XRef map plus trailer dictionary.
@@ -221,11 +237,14 @@ parseTraditionalXRef raw = do
 
 -- | Parse zero or more xref subsections, stopping at "trailer".
 parseSubsections :: ByteString -> XRef -> Either String (ByteString, XRef)
-parseSubsections bs xref
-  | "trailer" `BS.isPrefixOf` bs = Right (bs, xref)
-  | otherwise = do
-      (bs', entries) <- parseSubsection bs
-      parseSubsections bs' (Map.union entries xref)
+parseSubsections bs xref =
+  -- Drop any whitespace between subsections (or before "trailer").
+  let bs' = dropWS bs
+  in if "trailer" `BS.isPrefixOf` bs'
+       then Right (bs', xref)
+       else do
+         (bs'', entries) <- parseSubsection bs'
+         parseSubsections bs'' (Map.union entries xref)
 
 -- | Parse one xref subsection: @firstObj count\n@ followed by entries.
 parseSubsection :: ByteString -> Either String (ByteString, XRef)
@@ -284,8 +303,19 @@ pairsOf (PDFInt a : PDFInt b : rest) = (a, b) : pairsOf rest
 pairsOf _                            = []
 
 -- | Parse all entries from a cross-reference stream.
+--
+-- Per PDF spec (ISO 32000 §7.5.8.2): when a field width is 0 the field is
+-- absent and defaults to its specification-defined value:
+--
+--   * field 1 (type): default 1 (in-use / offset entry)
+--   * field 2 (byte offset or object stream number): default 0
+--   * field 3 (generation number or object stream index): default 0
+--
+-- Fields 2 and 3 naturally default to 0 because 'readBEBytes' returns 0 for
+-- a zero-width field.  Only field 1 needs an explicit check since its default
+-- (1) differs from the zero returned by 'readBEBytes'.
 parseXRefStreamEntries
-  :: Int            -- ^ w1: width of type field (bytes)
+  :: Int            -- ^ w1: width of type field (bytes); 0 means default type 1
   -> Int            -- ^ w2: width of field 2 (bytes)
   -> Int            -- ^ w3: width of field 3 (bytes)
   -> [(Int, Int)]   -- ^ subsections as (firstObj, count) pairs
@@ -298,7 +328,8 @@ parseXRefStreamEntries w1 w2 w3 subsections streamBytes =
     go _   []                        acc = acc
     go pos ((firstObj, count) : rest) acc =
       let newEntries =
-            [ case readBEBytes w1 entryBytes of
+            [ let typ = if w1 == 0 then 1 else readBEBytes w1 entryBytes
+              in case typ of
                 0 -> Nothing   -- free
                 1 -> Just (firstObj + i,
                            XRefOffset (fromIntegral (readBEBytes w2 (BS.drop w1 entryBytes))))

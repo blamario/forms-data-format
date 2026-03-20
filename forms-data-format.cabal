@@ -33,6 +33,8 @@ library
     build-depends:    base == 4.*, bytestring >=0.9 && < 0.13, text >= 2.0.2 && < 2.2,
                       containers >= 0.6 && < 0.9,
                       zlib >= 0.6 && < 0.8,
+                      crypton >= 1.0 && < 2,
+                      ram >= 0.19 && < 0.22,
                       monoid-subclasses == 1.*, rank2classes >= 1 && < 1.6,
                       parsers < 0.13, grammatical-parsers >= 0.5 && < 0.8
     hs-source-dirs:   src

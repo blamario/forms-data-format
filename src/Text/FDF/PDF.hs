@@ -53,6 +53,7 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as LBS
 import qualified Codec.Compression.Zlib as Zlib
+import Data.Bits (shiftR)
 import Data.Char (chr, intToDigit, isDigit, isHexDigit, isSpace, ord)
 import Data.Int (Int64)
 import Data.List (foldl')
@@ -64,6 +65,11 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Word (Word8)
 import System.IO.Unsafe (unsafePerformIO)
+import qualified Crypto.Hash as CHash
+import qualified Crypto.Cipher.AES as CAES
+import qualified Crypto.Cipher.Types as CCipher
+import qualified Crypto.Error as CError
+import qualified Data.ByteArray as BA
 
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
 import qualified Text.FDF as FDF
@@ -81,12 +87,13 @@ parsePDF :: ByteString -> Either String FDF
 parsePDF bs = do
   xrefOff         <- findXRefOffset bs
   (xref, trailer) <- parseXRefChain bs xrefOff
+  dec             <- buildDecryptor bs xref trailer
   rootRef         <- dictLookupRef "Root" trailer
-  catalog         <- loadDict bs xref rootRef
+  catalog         <- loadDict bs xref dec rootRef
   acroRef         <- dictLookupRef "AcroForm" catalog
-  acroForm        <- loadDict bs xref acroRef
-  fieldsArr       <- loadArray bs xref "Fields" acroForm
-  fields          <- mapM (loadFieldObj bs xref) fieldsArr
+  acroForm        <- loadDict bs xref dec acroRef
+  fieldsArr       <- loadArray bs xref dec "Fields" acroForm
+  fields          <- mapM (loadFieldObj bs xref dec) fieldsArr
   case fields of
     []  -> Left "PDF has no AcroForm fields"
     [f] -> Right $ FDF
@@ -101,18 +108,20 @@ parsePDF bs = do
 -- | Fill the form fields of a PDF template using an 'FDF' value.
 --
 -- Uses an incremental-update append so the original PDF bytes are left intact.
--- Encrypted PDFs are not supported.
+-- Encrypted PDFs are supported for reading but the incremental update is
+-- written unencrypted (the new xref/trailer appended after the encrypted body).
 fillPDF :: FDF -> ByteString -> Either String ByteString
 fillPDF fdf pdfBytes = do
   xrefOff         <- findXRefOffset pdfBytes
   (xref, trailer) <- parseXRefChain pdfBytes xrefOff
+  dec             <- buildDecryptor pdfBytes xref trailer
   rootRef         <- dictLookupRef "Root" trailer
-  catalog         <- loadDict pdfBytes xref rootRef
+  catalog         <- loadDict pdfBytes xref dec rootRef
   acroRef         <- dictLookupRef "AcroForm" catalog
-  acroForm        <- loadDict pdfBytes xref acroRef
-  fieldsArr       <- loadArray pdfBytes xref "Fields" acroForm
+  acroForm        <- loadDict pdfBytes xref dec acroRef
+  fieldsArr       <- loadArray pdfBytes xref dec "Fields" acroForm
   -- Build mapping:  full path → (objNum, current dict)
-  pathMap         <- buildPathMap pdfBytes xref [] fieldsArr
+  pathMap         <- buildPathMap pdfBytes xref dec [] fieldsArr
   -- Collect leaf-value updates from FDF
   let updates      = collectUpdates [] (body fdf)
   -- Apply updates: produce list of (objNum, new dict)
@@ -150,6 +159,163 @@ data XRefEntry
 
 -- | Cross-reference table: maps object number to its location.
 type XRef = Map Int XRefEntry
+
+-- ---------------------------------------------------------------------------
+-- Stream decryption (PDF Standard Security Handler, R=4, AES-128-CBC)
+
+-- | A stream decryptor: given @(objectNumber, generationNumber, rawCiphertext)@
+-- returns the decrypted bytes.  The no-op 'noDecrypt' is used for unencrypted PDFs.
+type Decryptor = Int -> Int -> ByteString -> Either String ByteString
+
+-- | No-op decryptor for unencrypted PDFs.
+noDecrypt :: Decryptor
+noDecrypt _ _ bs = Right bs
+
+-- | Build a 'Decryptor' from the trailer dictionary.
+-- Returns 'noDecrypt' for unencrypted PDFs.
+-- Only the Standard Security Handler with @\/V 4@ \/ @\/R ≥ 3@ (AES-128-CBC)
+-- and an empty user password is currently supported.
+buildDecryptor
+  :: ByteString
+  -> XRef
+  -> Map ByteString PDFValue
+  -> Either String Decryptor
+buildDecryptor bs xref trailer =
+  case Map.lookup "Encrypt" trailer of
+    Nothing -> Right noDecrypt
+    Just (PDFRef n g) -> do
+      encDict <- loadEncryptDict bs xref n g
+      buildDecryptorFromDict encDict trailer
+    Just (PDFDict encDict) -> buildDecryptorFromDict encDict trailer
+    _ -> Left "Invalid /Encrypt entry in trailer"
+
+-- | Build a 'Decryptor' from a parsed /Encrypt dictionary.
+buildDecryptorFromDict
+  :: Map ByteString PDFValue
+  -> Map ByteString PDFValue
+  -> Either String Decryptor
+buildDecryptorFromDict encDict trailer = do
+  case Map.lookup "Filter" encDict of
+    Just (PDFName "Standard") -> return ()
+    Just f -> Left ("Unsupported encryption filter: " <> show f)
+    Nothing -> Left "Encrypt dict missing /Filter"
+  -- Extract first element of /ID array as the file identifier.
+  fileId <- case Map.lookup "ID" trailer of
+    Just (PDFArray (PDFString i : _)) -> Right i
+    _ -> Left "Trailer /ID missing or not an array of strings"
+  key <- computeFileEncKey encDict fileId
+  Right (makeAESDecryptor key)
+
+-- | Load the Encrypt dictionary by direct offset (it is never itself
+-- encrypted, so no decryptor is needed).
+loadEncryptDict :: ByteString -> XRef -> Int -> Int -> Either String (Map ByteString PDFValue)
+loadEncryptDict bs xref n _genNum =
+  case Map.lookup n xref of
+    Nothing -> Left $ "Encrypt object " <> show n <> " not in xref"
+    Just (XRefOffset off) -> do
+      v <- parseIndirectObject bs off
+      case v of
+        PDFDict d -> Right d
+        _ -> Left "Encrypt object is not a dictionary"
+    Just (XRefObjStm _ _) -> Left "Encrypt dict inside an ObjStm (not supported)"
+
+-- | Compute the 16-byte file encryption key for the empty user password using
+-- the Standard Security Handler algorithm (PDF spec §7.6.3.3, Algorithm 2).
+-- This handles R=3 and R=4 (the iterations step).
+computeFileEncKey
+  :: Map ByteString PDFValue   -- ^ the @\/Encrypt@ dictionary
+  -> ByteString                -- ^ first element of the @\/ID@ array
+  -> Either String ByteString
+computeFileEncKey encDict fileId = do
+  p <- case Map.lookup "P" encDict of
+         Just (PDFInt n) -> Right n
+         _ -> Left "Encrypt dict missing /P"
+  oVal <- case Map.lookup "O" encDict of
+            Just (PDFString s) -> Right s
+            _ -> Left "Encrypt dict missing /O"
+  let n        = 16   -- AES-128 key: 128 bits / 8
+      -- Step a: pad empty password to 32 bytes using the standard padding string.
+      padded   = BS.take 32 (pdfPasswordPadding <> BS.replicate 32 0)
+      -- Step d: pack P as signed 32-bit little-endian.
+      p32      = BS.pack [ fromIntegral  p
+                         , fromIntegral (p `shiftR`  8)
+                         , fromIntegral (p `shiftR` 16)
+                         , fromIntegral (p `shiftR` 24) ]
+      -- Steps b–e: MD5(padded_password ++ O ++ P_LE ++ FileID).
+      h0       = md5Hash (padded <> BS.take 32 oVal <> p32 <> fileId)
+      -- Step g: for R≥3, iterate MD5 50 more times (truncating to n bytes each round).
+      key      = foldl' (\acc _ -> md5Hash (BS.take n acc)) h0 ([1..50] :: [Int])
+  Right (BS.take n key)
+
+-- | Standard 32-byte password padding string (PDF spec §7.6.3.3).
+pdfPasswordPadding :: ByteString
+pdfPasswordPadding = BS.pack
+  [ 0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41
+  , 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08
+  , 0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80
+  , 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A ]
+
+-- | Build a stream 'Decryptor' that uses AES-128-CBC with per-object keys
+-- derived from the given file encryption key (PDF spec §7.6.2, Algorithm 1
+-- for AES streams).
+makeAESDecryptor :: ByteString -> Decryptor
+makeAESDecryptor fileKey objNum genNum rawStream
+  | BS.length rawStream < 16 = Left "Encrypted stream too short for AES-IV"
+  | otherwise =
+      let -- Per-object key: MD5(fileKey ++ objNum[3LE] ++ genNum[2LE] ++ "sAlT")
+          perObjKey = BS.take 16 $ md5Hash $
+                        fileKey
+                        <> BS.pack [ lo objNum, md objNum, hi objNum ]
+                        <> BS.pack [ lo genNum, md genNum ]
+                        <> "sAlT"
+          iv  = BS.take 16 rawStream
+          ct  = BS.drop 16 rawStream
+      in aes128CbcDecrypt perObjKey iv ct
+  where
+    lo n = fromIntegral  n
+    md n = fromIntegral (n `shiftR`  8)
+    hi n = fromIntegral (n `shiftR` 16)
+
+-- | Compute the MD5 hash of a 'ByteString', returning the result as a
+-- 16-byte 'ByteString'.
+--
+-- We obtain the hash via 'show' (which produces lowercase hex) and convert
+-- back to bytes, avoiding any 'ByteArray'/'ByteArrayAccess' typeclass issues
+-- between 'crypton' and 'memory'.
+md5Hash :: ByteString -> ByteString
+md5Hash bs =
+  let hexStr = BSC.pack (show (CHash.hashWith CHash.MD5 bs))
+  in BS.pack [ fromIntegral (hexDigit (BSC.index hexStr (2 * i)) * 16
+                           + hexDigit (BSC.index hexStr (2 * i + 1)))
+             | i <- [0 .. 15] ]
+
+-- | AES-128-CBC decrypt, then strip PKCS#7 padding.
+-- Converts all ByteStrings to 'BA.Bytes' for the crypto operations to avoid
+-- relying on the 'ByteArray ByteString' instance from the 'memory' package.
+aes128CbcDecrypt :: ByteString -> ByteString -> ByteString -> Either String ByteString
+aes128CbcDecrypt key iv ct =
+  let keyB = BA.convert key :: BA.Bytes
+  in case (CCipher.cipherInit keyB :: CError.CryptoFailable CAES.AES128) of
+       CError.CryptoPassed cipher ->
+         let ivB = BA.convert iv :: BA.Bytes
+         in case (CCipher.makeIV ivB :: Maybe (CCipher.IV CAES.AES128)) of
+              Nothing  -> Left "AES: invalid IV length"
+              Just iv' ->
+                let ctB  = BA.convert ct :: BA.Bytes
+                    plain :: BA.Bytes
+                    plain = CCipher.cbcDecrypt cipher iv' ctB
+                in Right (pkcs7Unpad (BS.pack (BA.unpack plain)))
+       CError.CryptoFailed err -> Left ("AES init error: " <> show err)
+
+-- | Remove PKCS#7 padding from a decrypted block.
+pkcs7Unpad :: ByteString -> ByteString
+pkcs7Unpad bs
+  | BS.null bs = bs
+  | otherwise  =
+      let pad = fromIntegral (BS.last bs)
+      in if pad >= 1 && pad <= 16 && pad <= BS.length bs
+         then BS.dropEnd pad bs
+         else bs
 
 -- ---------------------------------------------------------------------------
 -- Finding startxref
@@ -522,18 +688,18 @@ unfilterRow filt rawRow prevRow =
 -- Object loading
 
 -- | Load and dereference an object.  References are followed one level deep.
-loadObject :: ByteString -> XRef -> PDFValue -> Either String PDFValue
-loadObject bs xref (PDFRef n _) =
+loadObject :: ByteString -> XRef -> Decryptor -> PDFValue -> Either String PDFValue
+loadObject bs xref dec (PDFRef n _) =
   case Map.lookup n xref of
     Nothing                 -> Left $ "Object " <> show n <> " not in xref"
     Just (XRefOffset off)   -> parseIndirectObject bs off
-    Just (XRefObjStm sn ix) -> loadFromObjStream bs xref sn ix
-loadObject _ _ v = Right v
+    Just (XRefObjStm sn ix) -> loadFromObjStream bs xref dec sn ix
+loadObject _ _ _ v = Right v
 
 -- | Load an object that must be a dictionary.
-loadDict :: ByteString -> XRef -> (Int, Int) -> Either String (Map ByteString PDFValue)
-loadDict bs xref (n, g) = do
-  v <- loadObject bs xref (PDFRef n g)
+loadDict :: ByteString -> XRef -> Decryptor -> (Int, Int) -> Either String (Map ByteString PDFValue)
+loadDict bs xref dec (n, g) = do
+  v <- loadObject bs xref dec (PDFRef n g)
   case v of
     PDFDict d -> Right d
     _         -> Left $ "Object " <> show n <> " is not a dictionary"
@@ -554,14 +720,14 @@ parseIndirectObject bs off = do
 -- | Load an object stored inside an object stream.
 -- @stmObjNum@ is the object number of the ObjStm; @idx@ is the 0-based index
 -- of the desired object within that stream.
-loadFromObjStream :: ByteString -> XRef -> Int -> Int -> Either String PDFValue
-loadFromObjStream bs xref stmObjNum idx = do
+loadFromObjStream :: ByteString -> XRef -> Decryptor -> Int -> Int -> Either String PDFValue
+loadFromObjStream bs xref dec stmObjNum idx = do
   stmOff <- case Map.lookup stmObjNum xref of
     Just (XRefOffset off) -> Right off
     Just (XRefObjStm _ _) -> Left "Object stream is itself compressed (not supported)"
     Nothing               -> Left $ "Object stream " <> show stmObjNum <> " not in xref"
   -- Parse the stream, resolving /Length via the xref if it's indirect.
-  (rawDict, rawBytes) <- parseStreamAtIndirectLen bs xref stmOff
+  (rawDict, rawBytes) <- parseStreamAtIndirectLen bs xref dec stmObjNum stmOff
   streamBytes         <- decompressStream rawDict rawBytes
   -- /N: number of objects; /First: byte offset of first object in body.
   n     <- toInt =<< maybe (Left "ObjStm missing /N")     Right (Map.lookup "N"     rawDict)
@@ -575,16 +741,20 @@ loadFromObjStream bs xref stmObjNum idx = do
   let body = BS.drop (first + relOff) streamBytes
   fst <$> parseValue (dropWS body)
 
--- | Like 'parseStreamAt' but resolves an indirect /Length reference.
+-- | Like 'parseStreamAt' but resolves an indirect @\/Length@ reference and
+-- applies the decryptor before decompression.
 parseStreamAtIndirectLen
   :: ByteString
   -> XRef
+  -> Decryptor
+  -> Int    -- ^ object number of the stream (for per-object decryption key)
   -> Int64
   -> Either String (Map ByteString PDFValue, ByteString)
-parseStreamAtIndirectLen bs xref off = do
+parseStreamAtIndirectLen bs xref dec objNum off = do
   let chunk = dropWS (BS.drop (fromIntegral off) bs)
   let (_, r1) = BSC.span isDigit chunk
-      (_, r2) = BSC.span isDigit (dropWS r1)
+      (genStr, r2) = BSC.span isDigit (dropWS r1)
+      genNum = readDecimal genStr
       r3      = dropWS r2
   after <- case BSC.stripPrefix "obj" r3 of
     Just r  -> Right (dropWS r)
@@ -593,7 +763,7 @@ parseStreamAtIndirectLen bs xref off = do
   -- Resolve indirect /Length if necessary.
   dict <- case Map.lookup "Length" dict0 of
     Just (PDFRef ln lg) -> do
-      lenVal <- loadObject bs xref (PDFRef ln lg)
+      lenVal <- loadObject bs xref dec (PDFRef ln lg)
       case lenVal of
         PDFInt n -> Right (Map.insert "Length" (PDFInt n) dict0)
         _        -> Left "Resolved /Length is not an integer"
@@ -611,7 +781,11 @@ parseStreamAtIndirectLen bs xref off = do
       len <- case Map.lookup "Length" dict of
                Just (PDFInt n) -> Right n
                _               -> Left "Stream /Length missing or not resolved"
-      Right (dict, BS.take len streamStart)
+      let rawBytes = BS.take len streamStart
+      -- Decrypt before decompression (xref streams are not encrypted;
+      -- ObjStm and other streams are encrypted when /Encrypt is present).
+      decrypted <- dec objNum genNum rawBytes
+      Right (dict, decrypted)
 
 -- | Parse the object-number/offset header of an object stream.
 -- Returns a list of @(objectNumber, relativeOffset)@ pairs.
@@ -630,24 +804,24 @@ parseObjStmHeader bs n = go (dropWS bs) n []
 -- AcroForm field loading
 
 -- | Load a single field object from a PDF reference.
-loadFieldObj :: ByteString -> XRef -> PDFValue -> Either String Field
-loadFieldObj bs xref ref = do
-  obj  <- loadObject bs xref ref
+loadFieldObj :: ByteString -> XRef -> Decryptor -> PDFValue -> Either String Field
+loadFieldObj bs xref dec ref = do
+  obj  <- loadObject bs xref dec ref
   dict <- case obj of
             PDFDict d -> Right d
             _         -> Left "Field is not a dictionary"
-  buildField bs xref dict
+  buildField bs xref dec dict
 
 -- | Build a 'Field' from a PDF field dictionary.
-buildField :: ByteString -> XRef -> Map ByteString PDFValue -> Either String Field
-buildField bs xref dict = do
+buildField :: ByteString -> XRef -> Decryptor -> Map ByteString PDFValue -> Either String Field
+buildField bs xref dec dict = do
   t    <- decodeFieldText dict "T"
   cont <- case Map.lookup "Kids" dict of
-    Just (PDFArray kids) -> Children <$> mapM (loadFieldObj bs xref) kids
+    Just (PDFArray kids) -> Children <$> mapM (loadFieldObj bs xref dec) kids
     Just ref@PDFRef{} -> do
-      kidsVal <- loadObject bs xref ref
+      kidsVal <- loadObject bs xref dec ref
       case kidsVal of
-        PDFArray kids -> Children <$> mapM (loadFieldObj bs xref) kids
+        PDFArray kids -> Children <$> mapM (loadFieldObj bs xref dec) kids
         _             -> Left "Kids is not an array"
     _ -> case Map.lookup "V" dict of
       Nothing              -> Right (FieldValue "")
@@ -683,33 +857,35 @@ type ObjRef = (Int, Int)  -- object number, generation
 buildPathMap
   :: ByteString
   -> XRef
+  -> Decryptor
   -> [Text]    -- ^ path prefix (ancestor names)
   -> [PDFValue]
   -> Either String (Map [Text] (ObjRef, Map ByteString PDFValue))
-buildPathMap bs xref prefix refs = do
-  entries <- mapM (buildPathEntry bs xref prefix) refs
+buildPathMap bs xref dec prefix refs = do
+  entries <- mapM (buildPathEntry bs xref dec prefix) refs
   return (Map.unions entries)
 
 buildPathEntry
   :: ByteString
   -> XRef
+  -> Decryptor
   -> [Text]
   -> PDFValue
   -> Either String (Map [Text] (ObjRef, Map ByteString PDFValue))
-buildPathEntry bs xref prefix ref = do
+buildPathEntry bs xref dec prefix ref = do
   (objNum, objGen) <- case ref of
     PDFRef n g -> Right (n, g)
     _          -> Left "Field entry in /Fields is not a reference"
-  dict <- loadDict bs xref (objNum, objGen)
+  dict <- loadDict bs xref dec (objNum, objGen)
   t    <- decodeFieldText dict "T"
   let path = prefix ++ [t]
   case Map.lookup "Kids" dict of
     Just (PDFArray kids) ->
-      buildPathMap bs xref path kids
+      buildPathMap bs xref dec path kids
     Just r@PDFRef{} -> do
-      kidsVal <- loadObject bs xref r
+      kidsVal <- loadObject bs xref dec r
       case kidsVal of
-        PDFArray kids -> buildPathMap bs xref path kids
+        PDFArray kids -> buildPathMap bs xref dec path kids
         _             -> Left "Kids is not an array"
     _ ->
       -- This is a leaf field.
@@ -1088,14 +1264,15 @@ dictLookupRef key d =
 loadArray
   :: ByteString
   -> XRef
+  -> Decryptor
   -> ByteString                    -- ^ key name
   -> Map ByteString PDFValue
   -> Either String [PDFValue]
-loadArray bs xref key d =
+loadArray bs xref dec key d =
   case Map.lookup key d of
     Just (PDFArray a) -> Right a
     Just ref@PDFRef{} -> do
-      v <- loadObject bs xref ref
+      v <- loadObject bs xref dec ref
       case v of
         PDFArray a -> Right a
         _          -> Left ("/" <> BSC.unpack key <> " reference is not an array")

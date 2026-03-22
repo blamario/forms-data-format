@@ -59,7 +59,7 @@ import Data.Int (Int64)
 import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
@@ -93,7 +93,7 @@ parsePDF bs = do
   acroRef         <- dictLookupRef "AcroForm" catalog
   acroForm        <- loadDict bs xref dec acroRef
   fieldsArr       <- loadArray bs xref dec "Fields" acroForm
-  fields          <- mapM (loadFieldObj bs xref dec) fieldsArr
+  fields          <- catMaybes <$> mapM (loadFieldObj bs xref dec) fieldsArr
   case fields of
     []  -> Left "PDF has no AcroForm fields"
     [f] -> Right $ FDF
@@ -804,7 +804,7 @@ parseObjStmHeader bs n = go (dropWS bs) n []
 -- AcroForm field loading
 
 -- | Load a single field object from a PDF reference.
-loadFieldObj :: ByteString -> XRef -> Decryptor -> PDFValue -> Either String Field
+loadFieldObj :: ByteString -> XRef -> Decryptor -> PDFValue -> Either String (Maybe Field)
 loadFieldObj bs xref dec ref = do
   obj  <- loadObject bs xref dec ref
   dict <- case obj of
@@ -813,22 +813,27 @@ loadFieldObj bs xref dec ref = do
   buildField bs xref dec dict
 
 -- | Build a 'Field' from a PDF field dictionary.
-buildField :: ByteString -> XRef -> Decryptor -> Map ByteString PDFValue -> Either String Field
-buildField bs xref dec dict = do
-  t    <- decodeFieldText dict "T"
-  cont <- case Map.lookup "Kids" dict of
-    Just (PDFArray kids) -> Children <$> mapM (loadFieldObj bs xref dec) kids
-    Just ref@PDFRef{} -> do
-      kidsVal <- loadObject bs xref dec ref
-      case kidsVal of
-        PDFArray kids -> Children <$> mapM (loadFieldObj bs xref dec) kids
-        _             -> Left "Kids is not an array"
-    _ -> case Map.lookup "V" dict of
-      Nothing              -> Right (FieldValue "")
-      Just (PDFString raw) -> Right (FieldValue (decodePDFString raw))
-      Just (PDFName nm)    -> Right (FieldValue (Text.decodeLatin1 nm))
-      Just _               -> Right (FieldValue "")
-  return Field { name = t, content = cont }
+-- Returns 'Nothing' for widget annotations that have no @\/T@ entry and so
+-- cannot participate in the FDF field hierarchy.
+buildField :: ByteString -> XRef -> Decryptor -> Map ByteString PDFValue -> Either String (Maybe Field)
+buildField bs xref dec dict =
+  case Map.lookup "T" dict of
+    Nothing -> Right Nothing  -- widget annotation without /T; skip it
+    _ -> do
+      t    <- decodeFieldText dict "T"
+      cont <- case Map.lookup "Kids" dict of
+        Just (PDFArray kids) -> Children . catMaybes <$> mapM (loadFieldObj bs xref dec) kids
+        Just ref@PDFRef{} -> do
+          kidsVal <- loadObject bs xref dec ref
+          case kidsVal of
+            PDFArray kids -> Children . catMaybes <$> mapM (loadFieldObj bs xref dec) kids
+            _             -> Left "Kids is not an array"
+        _ -> case Map.lookup "V" dict of
+          Nothing              -> Right (FieldValue "")
+          Just (PDFString raw) -> Right (FieldValue (decodePDFString raw))
+          Just (PDFName nm)    -> Right (FieldValue (Text.decodeLatin1 nm))
+          Just _               -> Right (FieldValue "")
+      return $ Just Field { name = t, content = cont }
 
 -- | Decode the value of a string-typed field entry as 'Text'.
 decodeFieldText :: Map ByteString PDFValue -> ByteString -> Either String Text
@@ -877,19 +882,22 @@ buildPathEntry bs xref dec prefix ref = do
     PDFRef n g -> Right (n, g)
     _          -> Left "Field entry in /Fields is not a reference"
   dict <- loadDict bs xref dec (objNum, objGen)
-  t    <- decodeFieldText dict "T"
-  let path = prefix ++ [t]
-  case Map.lookup "Kids" dict of
-    Just (PDFArray kids) ->
-      buildPathMap bs xref dec path kids
-    Just r@PDFRef{} -> do
-      kidsVal <- loadObject bs xref dec r
-      case kidsVal of
-        PDFArray kids -> buildPathMap bs xref dec path kids
-        _             -> Left "Kids is not an array"
-    _ ->
-      -- This is a leaf field.
-      Right $ Map.singleton path ((objNum, objGen), dict)
+  case Map.lookup "T" dict of
+    Nothing -> Right Map.empty  -- widget annotation without /T; skip it
+    _ -> do
+      t <- decodeFieldText dict "T"
+      let path = prefix ++ [t]
+      case Map.lookup "Kids" dict of
+        Just (PDFArray kids) ->
+          buildPathMap bs xref dec path kids
+        Just r@PDFRef{} -> do
+          kidsVal <- loadObject bs xref dec r
+          case kidsVal of
+            PDFArray kids -> buildPathMap bs xref dec path kids
+            _             -> Left "Kids is not an array"
+        _ ->
+          -- This is a leaf field.
+          Right $ Map.singleton path ((objNum, objGen), dict)
 
 -- ---------------------------------------------------------------------------
 -- Collecting FDF leaf values

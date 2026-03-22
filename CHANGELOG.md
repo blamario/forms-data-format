@@ -1,5 +1,14 @@
 # Revision history for forms-data-format
 
+## 0.4 -- 2026-03-18
+
+* Added module `Text.FDF.PDF` with `parsePDF` and `fillPDF` functions for
+  converting between PDF AcroForm fields and FDF format, removing the need
+  for the external `pdftk` tool
+* Added executables `pdf-to-fdf` and `fdf-to-pdf`
+* Added `cabal.project` to allow building with GHC 9.6+ (relaxes overly
+  strict upper bounds on `base` in transitive dependencies)
+
 ## 0.1 -- 2023-04-03
 
 * First version. Released on an unsuspecting world.

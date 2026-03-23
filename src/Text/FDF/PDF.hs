@@ -822,18 +822,38 @@ buildField bs xref dec dict =
     _ -> do
       t    <- decodeFieldText dict "T"
       cont <- case Map.lookup "Kids" dict of
-        Just (PDFArray kids) -> Children . catMaybes <$> mapM (loadFieldObj bs xref dec) kids
+        Just (PDFArray kids) -> kidsContent bs xref dec dict kids
         Just ref@PDFRef{} -> do
           kidsVal <- loadObject bs xref dec ref
           case kidsVal of
-            PDFArray kids -> Children . catMaybes <$> mapM (loadFieldObj bs xref dec) kids
+            PDFArray kids -> kidsContent bs xref dec dict kids
             _             -> Left "Kids is not an array"
-        _ -> case Map.lookup "V" dict of
-          Nothing              -> Right (FieldValue "")
-          Just (PDFString raw) -> Right (FieldValue (decodePDFString raw))
-          Just (PDFName nm)    -> Right (FieldValue (Text.decodeLatin1 nm))
-          Just _               -> Right (FieldValue "")
+        _ -> leafFieldValue dict
       return $ Just Field { name = t, content = cont }
+
+-- | Build the 'FieldContent' for a field's @\/Kids@ array.
+-- If all kids are anonymous widget annotations (no @\/T@), the field is
+-- treated as a leaf and its own @\/V@ value is returned instead.
+kidsContent
+  :: ByteString -> XRef -> Decryptor
+  -> Map ByteString PDFValue  -- ^ the parent field's dictionary (for fallback @\/V@)
+  -> [PDFValue]               -- ^ the raw kid references
+  -> Either String FieldContent
+kidsContent bs xref dec parentDict kids = do
+  namedKids <- catMaybes <$> mapM (loadFieldObj bs xref dec) kids
+  if null namedKids
+    then leafFieldValue parentDict   -- all kids are widget annotations → leaf
+    else return (Children namedKids)
+
+-- | Extract the @\/V@ field value from a PDF field dictionary as a 'FieldContent'.
+-- PDF name objects (including empty ones, representing no-selection) are returned
+-- as 'FieldNameValue'; string objects are returned as 'FieldValue'.
+leafFieldValue :: Map ByteString PDFValue -> Either String FieldContent
+leafFieldValue dict = case Map.lookup "V" dict of
+  Nothing              -> Right (FieldValue "")
+  Just (PDFString raw) -> Right (FieldValue (decodePDFString raw))
+  Just (PDFName nm)    -> Right (FieldNameValue (Text.decodeLatin1 nm))
+  Just _               -> Right (FieldValue "")
 
 -- | Decode the value of a string-typed field entry as 'Text'.
 decodeFieldText :: Map ByteString PDFValue -> ByteString -> Either String Text
@@ -888,13 +908,20 @@ buildPathEntry bs xref dec prefix ref = do
       t <- decodeFieldText dict "T"
       let path = prefix ++ [t]
       case Map.lookup "Kids" dict of
-        Just (PDFArray kids) ->
-          buildPathMap bs xref dec path kids
+        Just (PDFArray kids) -> do
+          m <- buildPathMap bs xref dec path kids
+          if Map.null m
+            then Right $ Map.singleton path ((objNum, objGen), dict)  -- all kids are widgets
+            else Right m
         Just r@PDFRef{} -> do
           kidsVal <- loadObject bs xref dec r
           case kidsVal of
-            PDFArray kids -> buildPathMap bs xref dec path kids
-            _             -> Left "Kids is not an array"
+            PDFArray kids -> do
+              m <- buildPathMap bs xref dec path kids
+              if Map.null m
+                then Right $ Map.singleton path ((objNum, objGen), dict)
+                else Right m
+            _ -> Left "Kids is not an array"
         _ ->
           -- This is a leaf field.
           Right $ Map.singleton path ((objNum, objGen), dict)
@@ -907,8 +934,9 @@ collectUpdates :: [Text] -> Field -> [([Text], Text)]
 collectUpdates prefix Field { name = n, content = cont } =
   let path = if Text.null n then prefix else prefix ++ [n]
   in case cont of
-    FieldValue v  -> [(path, v)]
-    Children kids -> concatMap (collectUpdates path) kids
+    FieldValue v      -> [(path, v)]
+    FieldNameValue v  -> [(path, v)]
+    Children kids     -> concatMap (collectUpdates path) kids
 
 -- ---------------------------------------------------------------------------
 -- Applying updates
@@ -926,7 +954,11 @@ applyUpdate pathMap (Right (objs, maxN)) (path, newVal) =
   case Map.lookup path pathMap of
     Nothing        -> Right (objs, maxN)  -- field not in PDF, skip
     Just (ref, d)  ->
-      let newDict = Map.insert "V" (PDFString (encodePDFStringValue newVal)) d
+      -- Preserve the original /V type: name fields stay as PDFName, strings as PDFString.
+      let pdfVal = case Map.lookup "V" d of
+                     Just (PDFName _) -> PDFName (Text.encodeUtf8 newVal)
+                     _                -> PDFString (encodePDFStringValue newVal)
+          newDict = Map.insert "V" pdfVal d
       in Right ((ref, newDict) : objs, maxN)
 
 -- ---------------------------------------------------------------------------

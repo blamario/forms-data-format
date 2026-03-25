@@ -1,9 +1,3 @@
 dist-newstyle/
-pdf-toolbox-core-*/
-pdf-toolbox-document-*/
-*.o
-*.hi
-*.dyn_o
-*.dyn_hi
 cabal.project.local
 .ghc.environment.*

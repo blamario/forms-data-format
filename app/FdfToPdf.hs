@@ -4,7 +4,9 @@
 
 module Main (main) where
 
+import Control.Applicative ((<|>))
 import Data.ByteString qualified as ByteString
+import System.IO (hSetBinaryMode, stdin)
 import Options.Applicative qualified as OptsAp
 
 import Text.FDF qualified as FDF
@@ -27,10 +29,17 @@ optionsParser = Options
   <*> (OptsAp.strArgument
          (OptsAp.metavar "<output.pdf>"
           <> OptsAp.help "Output PDF file (default: write to stdout)")
-       OptsAp.<|> pure "-")
+       <|> pure "-")
 
 throwError :: String -> IO a
 throwError = ioError . userError
+
+-- | Read a file, or read from stdin if the path is @"-"@.
+readFileOrStdin :: FilePath -> IO ByteString.ByteString
+readFileOrStdin "-" = do
+  hSetBinaryMode stdin True
+  ByteString.getContents
+readFileOrStdin path = ByteString.readFile path
 
 main :: IO ()
 main = do
@@ -39,8 +48,8 @@ main = do
       (OptsAp.fullDesc
        <> OptsAp.progDesc "Fill AcroForm fields of a PDF template with values from an FDF file"
        <> OptsAp.header "fdf-to-pdf - fill PDF from FDF")
-  fdfBytes <- ByteString.readFile (fdfInput opts)
-  pdfBytes <- ByteString.readFile (pdfInput opts)
+  fdfBytes <- readFileOrStdin (fdfInput opts)
+  pdfBytes <- readFileOrStdin (pdfInput opts)
   fdf <- case FDF.parse fdfBytes of
     Left err  -> throwError $ "Error parsing FDF: " <> err
     Right fdf -> return fdf

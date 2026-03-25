@@ -2,45 +2,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | Conversion between PDF AcroForm fields and FDF format, replacing the need
--- for the external @pdftk@ tool.
---
--- == Usage
---
--- To extract form field data from a PDF file into an FDF value:
---
--- @
--- import qualified Data.ByteString as ByteString
--- import Text.FDF (serialize)
--- import Text.FDF.PDF (parsePDF)
---
--- main :: IO ()
--- main = do
---   pdfBytes <- ByteString.readFile "form.pdf"
---   case parsePDF pdfBytes of
---     Left err  -> putStrLn $ "Error: " ++ err
---     Right fdf -> ByteString.writeFile "form.fdf" (serialize fdf)
--- @
---
--- To fill the form fields of a PDF template using an FDF value and write the
--- resulting PDF:
---
--- @
--- import qualified Data.ByteString as ByteString
--- import Text.FDF (parse)
--- import Text.FDF.PDF (fillPDF)
---
--- main :: IO ()
--- main = do
---   fdfBytes <- ByteString.readFile "data.fdf"
---   pdfBytes <- ByteString.readFile "template.pdf"
---   case FDF.parse fdfBytes of
---     Left err  -> putStrLn $ "FDF parse error: " ++ err
---     Right fdf ->
---       case fillPDF fdf pdfBytes of
---         Left err     -> putStrLn $ "Fill error: " ++ err
---         Right filled -> ByteString.writeFile "filled.pdf" filled
--- @
+-- | Conversion between PDF AcroForm fields and FDF format.
 module Text.FDF.PDF
   ( parsePDF
   , fillPDF
@@ -74,9 +36,6 @@ import qualified Data.ByteArray as BA
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
 import qualified Text.FDF as FDF
 
--- ---------------------------------------------------------------------------
--- Public API
-
 -- | Extract form field data from a PDF file.
 --
 -- Reads the PDF's AcroForm structure and returns the corresponding 'FDF'
@@ -85,15 +44,8 @@ import qualified Text.FDF as FDF
 -- object streams.
 parsePDF :: ByteString -> Either String FDF
 parsePDF bs = do
-  xrefOff         <- findXRefOffset bs
-  (xref, trailer) <- parseXRefChain bs xrefOff
-  dec             <- buildDecryptor bs xref trailer
-  rootRef         <- dictLookupRef "Root" trailer
-  catalog         <- loadDict bs xref dec rootRef
-  acroRef         <- dictLookupRef "AcroForm" catalog
-  acroForm        <- loadDict bs xref dec acroRef
-  fieldsArr       <- loadArray bs xref dec "Fields" acroForm
-  fields          <- catMaybes <$> mapM (loadFieldObj bs xref dec) fieldsArr
+  (_, xref, trailer, dec, fieldsArr) <- loadAcroFormFields bs
+  fields <- catMaybes <$> mapM (loadFieldObj bs xref dec) fieldsArr
   case fields of
     []  -> Left "PDF has no AcroForm fields"
     [f] -> Right $ FDF
@@ -112,26 +64,36 @@ parsePDF bs = do
 -- written unencrypted (the new xref/trailer appended after the encrypted body).
 fillPDF :: FDF -> ByteString -> Either String ByteString
 fillPDF fdf pdfBytes = do
-  xrefOff         <- findXRefOffset pdfBytes
-  (xref, trailer) <- parseXRefChain pdfBytes xrefOff
-  dec             <- buildDecryptor pdfBytes xref trailer
-  rootRef         <- dictLookupRef "Root" trailer
-  catalog         <- loadDict pdfBytes xref dec rootRef
-  acroRef         <- dictLookupRef "AcroForm" catalog
-  acroForm        <- loadDict pdfBytes xref dec acroRef
-  fieldsArr       <- loadArray pdfBytes xref dec "Fields" acroForm
+  (xrefOff, xref, trailer, dec, fieldsArr) <- loadAcroFormFields pdfBytes
   -- Build mapping:  full path → (objNum, current dict)
-  pathMap         <- buildPathMap pdfBytes xref dec [] fieldsArr
+  pathMap      <- buildPathMap pdfBytes xref dec [] fieldsArr
   -- Collect leaf-value updates from FDF
-  let updates      = collectUpdates [] (body fdf)
+  let updates   = collectUpdates [] (body fdf)
   -- Apply updates: produce list of (objNum, new dict)
-  let totalObjs    = fromMaybe 0 $ do
+  let totalObjs = fromMaybe 0 $ do
         PDFInt n <- Map.lookup "Size" trailer
         return n
   (newObjs, _) <- foldl' (applyUpdate pathMap) (Right ([], totalObjs)) updates
-  if null newObjs
-    then Right pdfBytes
-    else Right $ appendIncrementalUpdate pdfBytes xrefOff trailer newObjs
+  Right $ if null newObjs
+    then pdfBytes
+    else appendIncrementalUpdate pdfBytes xrefOff trailer newObjs
+
+-- | Parse the PDF cross-reference tables and locate the AcroForm @\/Fields@
+-- array, returning the xref offset, xref table, trailer dictionary,
+-- decryptor, and field references.
+loadAcroFormFields
+  :: ByteString
+  -> Either String (Int64, XRef, Map ByteString PDFValue, Decryptor, [PDFValue])
+loadAcroFormFields bs = do
+  xrefOff         <- findXRefOffset bs
+  (xref, trailer) <- parseXRefChain bs xrefOff
+  dec             <- buildDecryptor bs xref trailer
+  rootRef         <- dictLookupRef "Root" trailer
+  catalog         <- loadDict bs xref dec rootRef
+  acroRef         <- dictLookupRef "AcroForm" catalog
+  acroForm        <- loadDict bs xref dec acroRef
+  fieldsArr       <- loadArray bs xref dec "Fields" acroForm
+  return (xrefOff, xref, trailer, dec, fieldsArr)
 
 -- ---------------------------------------------------------------------------
 -- PDF value types

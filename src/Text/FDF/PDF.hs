@@ -9,6 +9,7 @@ module Text.FDF.PDF
   ) where
 
 import Control.Exception (SomeException, evaluate, try)
+import Control.Monad (when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -18,7 +19,11 @@ import qualified Codec.Compression.Zlib as Zlib
 import Data.Bits (shiftR)
 import Data.Char (chr, intToDigit, isDigit, isHexDigit, isSpace, ord)
 import Data.Int (Int64)
+import Data.IntMap.Strict (IntMap)
+import qualified Data.IntMap.Strict as IntMap
 import Data.List (foldl')
+import Data.List.NonEmpty (NonEmpty)
+import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe)
@@ -120,7 +125,7 @@ data XRefEntry
   deriving (Eq, Show)
 
 -- | Cross-reference table: maps object number to its location.
-type XRef = Map Int XRefEntry
+type XRef = IntMap XRefEntry
 
 -- ---------------------------------------------------------------------------
 -- Stream decryption (PDF Standard Security Handler, R=4, AES-128-CBC)
@@ -172,7 +177,7 @@ buildDecryptorFromDict encDict trailer = do
 -- encrypted, so no decryptor is needed).
 loadEncryptDict :: ByteString -> XRef -> Int -> Int -> Either String (Map ByteString PDFValue)
 loadEncryptDict bs xref n _genNum =
-  case Map.lookup n xref of
+  case IntMap.lookup n xref of
     Nothing -> Left $ "Encrypt object " <> show n <> " not in xref"
     Just (XRefOffset off) -> do
       v <- parseIndirectObject bs off
@@ -329,14 +334,14 @@ parseXRefChain bs off = do
                   Left err        -> Left ("/XRefStm parse error: " <> err)
                   Right (stmXref, _) ->
                     -- Main xref takes precedence over the hybrid stream.
-                    Right (Map.union xref stmXref)
+                    Right (IntMap.union xref stmXref)
               _ -> return xref
   -- Follow the /Prev chain to older xref sections.
   case Map.lookup "Prev" trailer of
     Just (PDFInt prev) -> do
       (prevXRef, _) <- parseXRefChain bs (fromIntegral prev)
       -- Newer (current) entries take precedence over older ones.
-      return (Map.union xref' prevXRef, trailer)
+      return (IntMap.union xref' prevXRef, trailer)
     _ -> return (xref', trailer)
 
 -- | Parse a single cross-reference section (either traditional table or
@@ -356,7 +361,7 @@ parseTraditionalXRef :: ByteString -> Either String (XRef, Map ByteString PDFVal
 parseTraditionalXRef raw = do
   -- Skip "xref" + whitespace
   let bs0 = dropWS (BS.drop 4 raw)
-  (bs1, xref) <- parseSubsections bs0 Map.empty
+  (bs1, xref) <- parseSubsections bs0 IntMap.empty
   -- bs1 should now start with "trailer"
   let afterTrailer = dropWS (BS.drop 7 bs1)  -- skip "trailer"
   case parseDict afterTrailer of
@@ -372,19 +377,19 @@ parseSubsections bs xref =
        then Right (bs', xref)
        else do
          (bs'', entries) <- parseSubsection bs'
-         parseSubsections bs'' (Map.union entries xref)
+         parseSubsections bs'' (IntMap.union entries xref)
 
 -- | Parse one xref subsection: @firstObj count\n@ followed by entries.
 parseSubsection :: ByteString -> Either String (ByteString, XRef)
 parseSubsection bs0 = do
   let (firstStr, r1) = BSC.span isDigit bs0
-  when (BS.null firstStr) (Left "Expected object number in xref subsection")
-  let firstObj = readDecimal firstStr
+  when (BS.null firstStr) $ Left "Expected object number in xref subsection"
+  firstObj <- readDecimal firstStr
   let (countStr, r2) = BSC.span isDigit (dropWS1 r1)
-  when (BS.null countStr) (Left "Expected count in xref subsection")
-  let count   = readDecimal countStr
-      r3      = dropLineEnd r2
-      entries = Map.fromList
+  when (BS.null countStr) $ Left "Expected count in xref subsection"
+  count <- readDecimal countStr
+  let r3      = dropLineEnd r2
+      entries = IntMap.fromList
                   [ (firstObj + i, e)
                   | i <- [0 .. count - 1]
                   , Just e <- [parseXRefEntry (BS.take 20 (BS.drop (i * 20) r3))]
@@ -395,7 +400,9 @@ parseSubsection bs0 = do
 parseXRefEntry :: ByteString -> Maybe XRefEntry
 parseXRefEntry entry
   | BS.length entry >= 18 && BSC.index entry 17 == 'f' = Nothing
-  | otherwise = Just (XRefOffset (fromIntegral (readDecimal (BS.take 10 entry))))
+  | otherwise = case BSC.readInt (BS.take 10 entry) of
+      Just (n, _) -> Just (XRefOffset (fromIntegral n))
+      Nothing     -> Nothing  -- malformed entry, skip
 
 -- ---------------------------------------------------------------------------
 -- Cross-reference stream (PDF 1.5+)
@@ -450,7 +457,7 @@ parseXRefStreamEntries
   -> ByteString     -- ^ decompressed stream bytes
   -> XRef
 parseXRefStreamEntries w1 w2 w3 subsections streamBytes =
-  go 0 subsections Map.empty
+  go 0 subsections IntMap.empty
   where
     entrySize = w1 + w2 + w3
     go _   []                        acc = acc
@@ -471,7 +478,7 @@ parseXRefStreamEntries w1 w2 w3 subsections streamBytes =
           acc' = foldl' insertEntry acc newEntries
       in go (pos + count * entrySize) rest acc'
     insertEntry m Nothing       = m
-    insertEntry m (Just (k, v)) = Map.insert k v m
+    insertEntry m (Just (k, v)) = IntMap.insert k v m
 
 -- | Read @n@ bytes as a big-endian unsigned integer.
 readBEBytes :: Int -> ByteString -> Int
@@ -652,7 +659,7 @@ unfilterRow filt rawRow prevRow =
 -- | Load and dereference an object.  References are followed one level deep.
 loadObject :: ByteString -> XRef -> Decryptor -> PDFValue -> Either String PDFValue
 loadObject bs xref dec (PDFRef n _) =
-  case Map.lookup n xref of
+  case IntMap.lookup n xref of
     Nothing                 -> Left $ "Object " <> show n <> " not in xref"
     Just (XRefOffset off)   -> parseIndirectObject bs off
     Just (XRefObjStm sn ix) -> loadFromObjStream bs xref dec sn ix
@@ -684,7 +691,7 @@ parseIndirectObject bs off = do
 -- of the desired object within that stream.
 loadFromObjStream :: ByteString -> XRef -> Decryptor -> Int -> Int -> Either String PDFValue
 loadFromObjStream bs xref dec stmObjNum idx = do
-  stmOff <- case Map.lookup stmObjNum xref of
+  stmOff <- case IntMap.lookup stmObjNum xref of
     Just (XRefOffset off) -> Right off
     Just (XRefObjStm _ _) -> Left "Object stream is itself compressed (not supported)"
     Nothing               -> Left $ "Object stream " <> show stmObjNum <> " not in xref"
@@ -716,8 +723,8 @@ parseStreamAtIndirectLen bs xref dec objNum off = do
   let chunk = dropWS (BS.drop (fromIntegral off) bs)
   let (_, r1) = BSC.span isDigit chunk
       (genStr, r2) = BSC.span isDigit (dropWS r1)
-      genNum = readDecimal genStr
       r3      = dropWS r2
+  genNum <- readDecimal genStr
   after <- case BSC.stripPrefix "obj" r3 of
     Just r  -> Right (dropWS r)
     Nothing -> Left ("Expected 'obj' at offset " <> show off)
@@ -760,7 +767,10 @@ parseObjStmHeader bs n = go (dropWS bs) n []
           (offStr, r2) = BSC.span isDigit (dropWS r1)
       in if BS.null numStr || BS.null offStr
          then Left "Truncated object stream header"
-         else go (dropWS r2) (k - 1) ((readDecimal numStr, readDecimal offStr) : acc)
+         else do
+           n <- readDecimal numStr
+           o <- readDecimal offStr
+           go (dropWS r2) (k - 1) ((n, o) : acc)
 
 -- ---------------------------------------------------------------------------
 -- AcroForm field loading
@@ -847,7 +857,7 @@ buildPathMap
   -> Decryptor
   -> [Text]    -- ^ path prefix (ancestor names)
   -> [PDFValue]
-  -> Either String (Map [Text] (ObjRef, Map ByteString PDFValue))
+  -> Either String (Map (NonEmpty Text) (ObjRef, Map ByteString PDFValue))
 buildPathMap bs xref dec prefix refs = do
   entries <- mapM (buildPathEntry bs xref dec prefix) refs
   return (Map.unions entries)
@@ -858,7 +868,7 @@ buildPathEntry
   -> Decryptor
   -> [Text]
   -> PDFValue
-  -> Either String (Map [Text] (ObjRef, Map ByteString PDFValue))
+  -> Either String (Map (NonEmpty Text) (ObjRef, Map ByteString PDFValue))
 buildPathEntry bs xref dec prefix ref = do
   (objNum, objGen) <- case ref of
     PDFRef n g -> Right (n, g)
@@ -868,12 +878,13 @@ buildPathEntry bs xref dec prefix ref = do
     Nothing -> Right Map.empty  -- widget annotation without /T; skip it
     _ -> do
       t <- decodeFieldText dict "T"
-      let path = prefix ++ [t]
+      let path   = prefix ++ [t]
+          pathNE = NonEmpty.fromList path  -- safe: appending [t] ensures non-empty
       case Map.lookup "Kids" dict of
         Just (PDFArray kids) -> do
           m <- buildPathMap bs xref dec path kids
           if Map.null m
-            then Right $ Map.singleton path ((objNum, objGen), dict)  -- all kids are widgets
+            then Right $ Map.singleton pathNE ((objNum, objGen), dict)  -- all kids are widgets
             else Right m
         Just r@PDFRef{} -> do
           kidsVal <- loadObject bs xref dec r
@@ -881,24 +892,28 @@ buildPathEntry bs xref dec prefix ref = do
             PDFArray kids -> do
               m <- buildPathMap bs xref dec path kids
               if Map.null m
-                then Right $ Map.singleton path ((objNum, objGen), dict)
+                then Right $ Map.singleton pathNE ((objNum, objGen), dict)
                 else Right m
             _ -> Left "Kids is not an array"
         _ ->
           -- This is a leaf field.
-          Right $ Map.singleton path ((objNum, objGen), dict)
+          Right $ Map.singleton pathNE ((objNum, objGen), dict)
 
 -- ---------------------------------------------------------------------------
 -- Collecting FDF leaf values
 
 -- | Return all leaf (path, value) pairs from an FDF body.
-collectUpdates :: [Text] -> Field -> [([Text], Text)]
+collectUpdates :: [Text] -> Field -> [(NonEmpty Text, Text)]
 collectUpdates prefix Field { name = n, content = cont } =
   let path = if Text.null n then prefix else prefix ++ [n]
   in case cont of
-    FieldValue v      -> [(path, v)]
-    FieldNameValue v  -> [(path, v)]
-    Children kids     -> concatMap (collectUpdates path) kids
+    FieldValue v     -> case NonEmpty.nonEmpty path of
+                          Nothing     -> []
+                          Just pathNE -> [(pathNE, v)]
+    FieldNameValue v -> case NonEmpty.nonEmpty path of
+                          Nothing     -> []
+                          Just pathNE -> [(pathNE, v)]
+    Children kids    -> concatMap (collectUpdates path) kids
 
 -- ---------------------------------------------------------------------------
 -- Applying updates
@@ -907,9 +922,9 @@ type UpdateAcc = Either String ([(ObjRef, Map ByteString PDFValue)], Int)
 
 -- | Add a modified field entry for one leaf-value update.
 applyUpdate
-  :: Map [Text] (ObjRef, Map ByteString PDFValue)
+  :: Map (NonEmpty Text) (ObjRef, Map ByteString PDFValue)
   -> UpdateAcc
-  -> ([Text], Text)
+  -> (NonEmpty Text, Text)
   -> UpdateAcc
 applyUpdate _pathMap (Left err) _ = Left err
 applyUpdate pathMap (Right (objs, maxN)) (path, newVal) =
@@ -1222,34 +1237,34 @@ parseDict bs0 = do
 
 -- | Parse an integer, real, or indirect reference (e.g. @1 0 R@).
 parseNumOrRef :: ByteString -> ParseResult PDFValue
-parseNumOrRef bs0 =
+parseNumOrRef bs0 = do
   let (sign, bs1) = case BSC.uncons bs0 of
                       Just ('-', r) -> ("-", r)
                       Just ('+', r) -> ("",  r)
                       _             -> ("",  bs0)
       (digits, rest) = BSC.span isDigit bs1
-  in if BS.null digits
-     then Left ("Expected number, got: " <> BSC.unpack (BS.take 10 bs0))
-     else
-       let n = readDecimal digits
-           signedN = if sign == "-" then negate n else n
-           -- Peek ahead: might be a real number or indirect reference.
-           rest' = dropWS rest
-       in case BSC.uncons rest' of
-            Just ('.', afterDot) ->
-              let (frac, rest'') = BSC.span isDigit afterDot
-                  dVal = fromIntegral signedN + fracVal frac
-              in Right (PDFReal dVal, rest'')
-            Just (c, _) | isDigit c && sign == "" ->
-              -- Could be "N G R" (indirect reference).
-              let (gen, rest'') = BSC.span isDigit rest'
-                  rest''' = dropWS rest''
-              in case BS.stripPrefix "R" rest''' of
-                   Just r  -> Right (PDFRef n (readDecimal gen), dropWS r)
-                   Nothing -> Right (PDFInt signedN, rest')
-            _ -> Right (PDFInt signedN, rest')
-  where
-    fracVal bs = fromIntegral (readDecimal bs) / (10 ^ BS.length bs)
+  when (BS.null digits) $ Left ("Expected number, got: " <> BSC.unpack (BS.take 10 bs0))
+  n <- readDecimal digits
+  let signedN = if sign == "-" then negate n else n
+      rest' = dropWS rest
+  case BSC.uncons rest' of
+    Just ('.', afterDot) ->
+      -- frac is the result of BSC.span isDigit, so it contains only digit
+      -- characters; BSC.readInt succeeds unless frac is empty (e.g. "3."),
+      -- in which case we treat the fractional part as zero.
+      let (frac, rest'') = BSC.span isDigit afterDot
+          fracN = maybe 0 fst (BSC.readInt frac)
+          dVal  = fromIntegral signedN + fromIntegral fracN / (10 ^ BS.length frac)
+      in Right (PDFReal dVal, rest'')
+    Just (c, _) | isDigit c && sign == "" -> do
+      -- Could be "N G R" (indirect reference).
+      let (gen, rest'') = BSC.span isDigit rest'
+          rest''' = dropWS rest''
+      genN <- readDecimal gen
+      case BS.stripPrefix "R" rest''' of
+        Just r  -> Right (PDFRef n genN, dropWS r)
+        Nothing -> Right (PDFInt signedN, rest')
+    _ -> Right (PDFInt signedN, rest')
 
 -- ---------------------------------------------------------------------------
 -- Dictionary lookup helpers
@@ -1307,11 +1322,9 @@ dropLineEnd bs = case BSC.uncons bs of
   Just ('\n', r) -> r
   _              -> bs
 
--- | Read a non-negative decimal integer from a 'ByteString'.
-readDecimal :: ByteString -> Int
-readDecimal bs = fst $ fromMaybe (0, "") (BSC.readInt bs)
-
--- | Convenience guard that short-circuits with a 'Left' message.
-when :: Bool -> Either String () -> Either String ()
-when True  e = e
-when False _ = Right ()
+-- | Read a non-negative decimal integer from a 'ByteString', failing with
+-- an error if the input does not start with at least one digit.
+readDecimal :: ByteString -> Either String Int
+readDecimal bs = case BSC.readInt bs of
+  Just (n, _) -> Right n
+  Nothing     -> Left ("Expected decimal integer, got: " <> BSC.unpack (BS.take 10 bs))

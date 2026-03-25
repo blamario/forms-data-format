@@ -4,6 +4,7 @@
 
 module Main (main) where
 
+import Control.Applicative ((<|>))
 import Data.ByteString qualified as ByteString
 import Options.Applicative qualified as OptsAp
 
@@ -23,7 +24,7 @@ optionsParser = Options
   <*> (OptsAp.strArgument
          (OptsAp.metavar "<output.fdf>"
           <> OptsAp.help "Output FDF file (default: write to stdout)")
-       OptsAp.<|> pure "-")
+       <|> pure "-")
 
 main :: IO ()
 main = do

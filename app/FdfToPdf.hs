@@ -5,6 +5,7 @@
 module Main (main) where
 
 import Control.Applicative ((<|>))
+import Control.Monad (when)
 import Data.ByteString qualified as ByteString
 import System.IO (hSetBinaryMode, stdin)
 import Options.Applicative qualified as OptsAp
@@ -48,6 +49,8 @@ main = do
       (OptsAp.fullDesc
        <> OptsAp.progDesc "Fill AcroForm fields of a PDF template with values from an FDF file"
        <> OptsAp.header "fdf-to-pdf - fill PDF from FDF")
+  when (fdfInput opts == "-" && pdfInput opts == "-") $
+    throwError "Only one of the two input arguments may be \"-\" (stdin)"
   fdfBytes <- readFileOrStdin (fdfInput opts)
   pdfBytes <- readFileOrStdin (pdfInput opts)
   fdf <- case FDF.parse fdfBytes of

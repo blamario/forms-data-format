@@ -1083,8 +1083,11 @@ buildTrailerSection size prevOff origTrailer =
               , ("Prev", PDFInt (fromIntegral prevOff))
               ] <>
               -- Carry over /Root and /Info from the original trailer.
+              -- /Encrypt is intentionally omitted: the incremental update is
+              -- written unencrypted, so including /Encrypt would cause viewers
+              -- to try (and fail) to decrypt the plaintext new objects.
               [ (k, v)
-              | k <- ["Root", "Info", "Encrypt"]
+              | k <- ["Root", "Info"]
               , Just v <- [Map.lookup k origTrailer]
               ]
   in LBS.toStrict $ BB.toLazyByteString $

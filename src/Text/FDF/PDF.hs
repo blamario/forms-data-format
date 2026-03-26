@@ -1117,7 +1117,9 @@ parseValue bs0 =
        'n' | "null"  `BS.isPrefixOf` bs -> Right (PDFNull,        BS.drop 4 bs)
        't' | "true"  `BS.isPrefixOf` bs -> Right (PDFBool True,   BS.drop 4 bs)
        'f' | "false" `BS.isPrefixOf` bs -> Right (PDFBool False,  BS.drop 5 bs)
-       '/'  -> (\(nm, r) -> (PDFName nm, r)) <$> parseName (BS.tail bs)
+       -- PDF names may be empty (e.g. the empty-selection state serialised as @\/@).
+       '/'  -> let (nm, rest) = BS.span isNameByte (BS.tail bs)
+               in Right (PDFName nm, rest)
        '('  -> (\(s,  r) -> (PDFString s, r)) <$> parseLiteralString (BS.tail bs) 0
        '<'  ->
          if BS.length bs >= 2 && BSC.index bs 1 == '<'
@@ -1128,16 +1130,19 @@ parseValue bs0 =
        _    -> Left ("Unexpected character: " <> [BSC.head bs])
 
 -- | Parse a PDF name token (without the leading '/').
+-- Returns an error for empty names, which are invalid as dictionary keys.
 parseName :: ByteString -> ParseResult ByteString
 parseName bs =
   let (nm, rest) = BS.span isNameByte bs
   in if BS.null nm
      then Left "Empty name"
      else Right (nm, rest)
-  where
-    isNameByte w =
-      let c = chr (fromIntegral w)
-      in not (isSpace c) && c `notElem` ("/()<>[]{}%\0" :: String)
+
+-- | Predicate for bytes that are valid inside a PDF name token.
+isNameByte :: Word8 -> Bool
+isNameByte w =
+  let c = chr (fromIntegral w)
+  in not (isSpace c) && c `notElem` ("/()<>[]{}%\0" :: String)
 
 -- | Parse a PDF literal string (the opening '(' has already been consumed).
 -- Depth tracks nesting: each '(' increments it and each ')' decrements it;

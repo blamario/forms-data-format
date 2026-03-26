@@ -65,8 +65,10 @@ parsePDF bs = do
 -- | Fill the form fields of a PDF template using an 'FDF' value.
 --
 -- Uses an incremental-update append so the original PDF bytes are left intact.
--- Encrypted PDFs are supported for reading but the incremental update is
--- written unencrypted (the new xref/trailer appended after the encrypted body).
+-- For encrypted PDFs (Standard Security Handler, empty user password), the
+-- new field-value objects are written with plaintext string values; the
+-- original body objects remain encrypted and the new trailer carries both
+-- @\/Encrypt@ and @\/ID@ so readers can still decrypt them.
 fillPDF :: FDF -> ByteString -> Either String ByteString
 fillPDF fdf pdfBytes = do
   (xrefOff, xref, trailer, dec, fieldsArr) <- loadAcroFormFields pdfBytes
@@ -1082,12 +1084,16 @@ buildTrailerSection size prevOff origTrailer =
               [ ("Size", PDFInt size)
               , ("Prev", PDFInt (fromIntegral prevOff))
               ] <>
-              -- Carry over /Root and /Info from the original trailer.
-              -- /Encrypt is intentionally omitted: the incremental update is
-              -- written unencrypted, so including /Encrypt would cause viewers
-              -- to try (and fail) to decrypt the plaintext new objects.
+              -- Carry over document-level entries from the original trailer.
+              -- /Encrypt and /ID must both be present when the source PDF is
+              -- encrypted: /Encrypt tells readers to decrypt the original body
+              -- objects (pages, fonts, etc.), and /ID is required by the
+              -- Standard Security Handler algorithm to derive the file key
+              -- (PDF spec §7.6.3.3 Algorithm 2).  Omitting either causes
+              -- readers to either prompt for a password or fail to read the
+              -- original page tree.
               [ (k, v)
-              | k <- ["Root", "Info"]
+              | k <- ["Root", "Info", "Encrypt", "ID"]
               , Just v <- [Map.lookup k origTrailer]
               ]
   in LBS.toStrict $ BB.toLazyByteString $

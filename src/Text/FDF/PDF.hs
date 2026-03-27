@@ -140,29 +140,29 @@ type Decryptor = Int -> Int -> ByteString -> Either String ByteString
 noDecrypt :: Decryptor
 noDecrypt _ _ bs = Right bs
 
--- | Build a 'Decryptor' from the trailer dictionary.
--- Returns 'noDecrypt' for unencrypted PDFs.
+-- | Build a 'Decryptor' and matching 'Encryptor' from the trailer dictionary.
+-- Returns 'noDecrypt' / 'noEncrypt' for unencrypted PDFs.
 -- Only the Standard Security Handler with @\/V 4@ \/ @\/R ≥ 3@ (AES-128-CBC)
 -- and an empty user password is currently supported.
 buildDecryptor
   :: ByteString
   -> XRef
   -> Map ByteString PDFValue
-  -> Either String Decryptor
+  -> Either String (Decryptor, Encryptor)
 buildDecryptor bs xref trailer =
   case Map.lookup "Encrypt" trailer of
-    Nothing -> Right noDecrypt
+    Nothing -> Right (noDecrypt, noEncrypt)
     Just (PDFRef n g) -> do
       encDict <- loadEncryptDict bs xref n g
       buildDecryptorFromDict encDict trailer
     Just (PDFDict encDict) -> buildDecryptorFromDict encDict trailer
     _ -> Left "Invalid /Encrypt entry in trailer"
 
--- | Build a 'Decryptor' from a parsed /Encrypt dictionary.
+-- | Build a 'Decryptor' and 'Encryptor' from a parsed /Encrypt dictionary.
 buildDecryptorFromDict
   :: Map ByteString PDFValue
   -> Map ByteString PDFValue
-  -> Either String Decryptor
+  -> Either String (Decryptor, Encryptor)
 buildDecryptorFromDict encDict trailer = do
   case Map.lookup "Filter" encDict of
     Just (PDFName "Standard") -> return ()
@@ -173,7 +173,7 @@ buildDecryptorFromDict encDict trailer = do
     Just (PDFArray (PDFString i : _)) -> Right i
     _ -> Left "Trailer /ID missing or not an array of strings"
   key <- computeFileEncKey encDict fileId
-  Right (makeAESDecryptor key)
+  Right (makeAESDecryptor key, makeAESEncryptor key)
 
 -- | Load the Encrypt dictionary by direct offset (it is never itself
 -- encrypted, so no decryptor is needed).
@@ -285,6 +285,70 @@ pkcs7Unpad bs
       in if pad >= 1 && pad <= 16 && pad <= BS.length bs
          then BS.dropEnd pad bs
          else bs
+
+-- | Add PKCS#7 padding to reach the next multiple of 16 bytes (1–16 bytes added).
+pkcs7Pad :: ByteString -> ByteString
+pkcs7Pad bs =
+  let padLen  = 16 - (BS.length bs `mod` 16)
+      padByte = fromIntegral padLen
+  in bs <> BS.replicate padLen padByte
+
+-- | AES-128-CBC encrypt (no padding; caller must pre-pad to a block multiple).
+aes128CbcEncrypt :: ByteString -> ByteString -> ByteString -> ByteString
+aes128CbcEncrypt key iv plaintext =
+  let keyB = BA.convert key :: BA.Bytes
+  in case (CCipher.cipherInit keyB :: CError.CryptoFailable CAES.AES128) of
+       CError.CryptoPassed cipher ->
+         let ivB = BA.convert iv :: BA.Bytes
+         in case (CCipher.makeIV ivB :: Maybe (CCipher.IV CAES.AES128)) of
+              Nothing  -> plaintext  -- cannot happen: IV is always 16 bytes
+              Just iv' ->
+                let ptB :: BA.Bytes
+                    ptB = BA.convert plaintext
+                    ct :: BA.Bytes
+                    ct  = CCipher.cbcEncrypt cipher iv' ptB
+                in BS.pack (BA.unpack ct)
+       CError.CryptoFailed _ -> plaintext  -- cannot happen: key is always 16 bytes
+
+-- | An object string encryptor: given (objectNumber, generationNumber, rawPlaintext)
+-- returns the AES-128-CBC ciphertext with a 16-byte IV prepended.
+-- The no-op 'noEncrypt' is used for unencrypted PDFs.
+type Encryptor = Int -> Int -> ByteString -> ByteString
+
+-- | No-op encryptor for unencrypted PDFs.
+noEncrypt :: Encryptor
+noEncrypt _ _ bs = bs
+
+-- | Build a string 'Encryptor' that uses AES-128-CBC with a deterministic IV
+-- derived from the per-object key (via MD5).  The resulting format is:
+-- @16-byte IV || AES-CBC(plaintext with PKCS#7 padding)@.
+makeAESEncryptor :: ByteString -> Encryptor
+makeAESEncryptor fileKey objNum genNum plaintext =
+  let perObjKey = BS.take 16 $ md5Hash $
+                    fileKey
+                    <> BS.pack [ lo objNum, md objNum, hi objNum ]
+                    <> BS.pack [ lo genNum, md genNum ]
+                    <> "sAlT"
+      -- Derive a deterministic IV from the per-object key so that it is
+      -- unique per object while remaining purely functional.
+      iv  = BS.take 16 (md5Hash (perObjKey <> "AES-IV"))
+      ct  = aes128CbcEncrypt perObjKey iv (pkcs7Pad plaintext)
+  in iv <> ct
+  where
+    lo n = fromIntegral  n
+    md n = fromIntegral (n `shiftR`  8)
+    hi n = fromIntegral (n `shiftR` 16)
+
+-- | Encrypt all 'PDFString' leaf values in a dictionary using the given
+-- 'Encryptor' (for a specific object number and generation number).
+-- 'PDFName', 'PDFRef', and other non-string values are left unchanged.
+encryptPDFValues :: Encryptor -> Int -> Int -> Map ByteString PDFValue -> Map ByteString PDFValue
+encryptPDFValues enc n g = Map.map go
+  where
+    go (PDFString bs) = PDFString (enc n g bs)
+    go (PDFArray vs)  = PDFArray  (map go vs)
+    go (PDFDict d)    = PDFDict   (Map.map go d)
+    go v              = v
 
 -- ---------------------------------------------------------------------------
 -- Finding startxref

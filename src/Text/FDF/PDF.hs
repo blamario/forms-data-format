@@ -18,6 +18,7 @@ import qualified Data.ByteString.Lazy as LBS
 import qualified Codec.Compression.Zlib as Zlib
 import Data.Bits (shiftR)
 import Data.Char (chr, intToDigit, isDigit, isHexDigit, isSpace, ord)
+import Numeric (showFFloat)
 import Data.Int (Int64)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
@@ -1072,7 +1073,7 @@ serializeValue = \case
   PDFBool True    -> "true"
   PDFBool False   -> "false"
   PDFInt n        -> BB.intDec n
-  PDFReal r       -> BB.string7 (show r)
+  PDFReal r       -> BB.string7 (showFFloat Nothing r "")
   PDFName nm      -> "/" <> BB.byteString nm
   PDFString bs    -> serializePDFString bs
   PDFArray vs     -> "[" <> foldMap (\v -> serializeValue v <> " ") vs <> "]"
@@ -1335,7 +1336,7 @@ parseNumOrRef bs0 = do
       let (frac, rest'') = BSC.span isDigit afterDot
           fracN = maybe 0 fst (BSC.readInt frac)
           dVal  = fromIntegral signedN + fromIntegral fracN / (10 ^ BS.length frac)
-      in Right (PDFReal dVal, rest'')
+      in parseOptionalExponent dVal rest''
     Just (c, _) | isDigit c && sign == "" -> do
       -- Could be "N G R" (indirect reference).
       let (gen, rest'') = BSC.span isDigit rest'
@@ -1345,6 +1346,27 @@ parseNumOrRef bs0 = do
         Just r  -> Right (PDFRef n genN, dropWS r)
         Nothing -> Right (PDFInt signedN, rest')
     _ -> Right (PDFInt signedN, rest')
+
+-- | If the bytestring starts with an @e@/@E@ exponent, consume it and
+-- return the adjusted 'PDFReal'; otherwise return the value as-is.
+-- This handles scientific notation that may appear in PDFs from other tools
+-- (e.g. @1.5e10@, @3.0E-2@) and also in our own round-trip when the
+-- underlying @Double@ is serialised via @show@.
+parseOptionalExponent :: Double -> ByteString -> ParseResult PDFValue
+parseOptionalExponent dVal bs =
+  case BSC.uncons bs of
+    Just (c, afterE) | c == 'e' || c == 'E' ->
+      let (expSign, afterSign) = case BSC.uncons afterE of
+                                   Just ('+', r) -> (1,    r)
+                                   Just ('-', r) -> (-1,   r)
+                                   _             -> (1,    afterE)
+          (expDigits, rest') = BSC.span isDigit afterSign
+      in if BS.null expDigits
+           then Right (PDFReal dVal, bs)  -- bare 'e' that is not an exponent; leave it
+           else case BSC.readInt expDigits of
+                  Just (e, _) -> Right (PDFReal (dVal * (10.0 ** fromIntegral (expSign * e))), rest')
+                  Nothing     -> Right (PDFReal dVal, bs)
+    _ -> Right (PDFReal dVal, bs)
 
 -- ---------------------------------------------------------------------------
 -- Dictionary lookup helpers

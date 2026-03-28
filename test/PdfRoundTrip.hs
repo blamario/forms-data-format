@@ -51,6 +51,21 @@ simplePDF = makePDF
   , (6, 0, "<< /Type /Annot /Subtype /Widget /FT /Tx /T (TextField1) /V (Hello) /Rect [100 700 400 720] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>")
   ]
 
+-- | Like 'simplePDF' but the field @\/Rect@ uses fractional coordinates
+-- whose @show@ representation would involve scientific notation
+-- (e.g. @0.05@ → @\"5.0e-2\"@).  This exercises the fix for the
+-- \"Unexpected character: e\" bug in @serializeValue@ / @parseNumOrRef@.
+floatRectPDF :: BS.ByteString
+floatRectPDF = makePDF
+  [ (1, 0, "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>")
+  , (2, 0, "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>")
+  , (3, 0, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [ 6 0 R ] >>")
+  , (4, 0, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+  , (5, 0, "<< /Fields [ 6 0 R ] /DR << /Font << /Helv 4 0 R >> >> >>")
+  -- /Rect uses 0.05 – a value whose show representation is "5.0e-2"
+  , (6, 0, "<< /Type /Annot /Subtype /Widget /FT /Tx /T (FloatField) /V (Hi) /Rect [0.05 0.05 200.05 12.05] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>")
+  ]
+
 -- | A minimal PDF with a radio button group (initially unselected: @\/V \/@)
 -- and a text field.  The radio group's child widget annotations have no @\/T@
 -- key, which is the pattern that caused the original bug.
@@ -183,6 +198,22 @@ testEmptyNameRoundTrip ref =
                other ->
                  modifyIORef ref (("Unexpected body: " <> show other) :)
 
+-- | A fill-and-parse round-trip on a PDF whose field annotation has
+-- fractional /Rect coordinates (e.g. 0.05) whose @show@ representation
+-- includes an @e@ exponent.  Before the fix this caused
+-- \"Unexpected character: e\" when pdf-to-fdf read the filled PDF.
+testFloatRectRoundTrip :: FailRef -> IO ()
+testFloatRectRoundTrip ref =
+  let fdf = makeFillFDF Field { name = "FloatField", content = FieldValue "OK" }
+  in case fillPDF fdf floatRectPDF of
+       Left err     -> modifyIORef ref (("fillPDF floatRectPDF: " <> err) :)
+       Right filled ->
+         case parsePDF filled of
+           Left err   -> modifyIORef ref (("round-trip parse (floatRect): " <> err) :)
+           Right fdf2 ->
+             assertM ref "FloatField value should be 'OK'" $
+               content (body fdf2) == FieldValue "OK"
+
 -- ---------------------------------------------------------------------------
 -- Main
 
@@ -195,6 +226,7 @@ main = do
   run "fill simple text field"               testFillSimple
   run "fill radio PDF (text field only)"     testFillRadio
   run "empty-name /V / survives round-trip"  testEmptyNameRoundTrip
+  run "float /Rect coords survive round-trip" testFloatRectRoundTrip
   failures <- readIORef failRef
   if null failures
     then do

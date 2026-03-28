@@ -3,6 +3,16 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Conversion between PDF AcroForm fields and FDF format.
+--
+-- References: PDF 32000-1:2008 (PDF 1.7 specification):
+--
+-- * §7.3 – Objects (booleans, numbers, strings, names, arrays, dictionaries)
+-- * §7.5 – File structure (cross-reference tables and streams, incremental updates)
+-- * §7.6 – Encryption (Standard Security Handler, AES-128-CBC, per-object keys)
+-- * §12.7 – Interactive forms (AcroForm, field dictionaries, @\/Kids@, @\/T@, @\/V@)
+--
+-- The module is intentionally self-contained (no external PDF library dependency).
+-- Future work may split the low-level parsing helpers into a separate internal module.
 module Text.FDF.PDF
   ( parsePDF
   , fillPDF

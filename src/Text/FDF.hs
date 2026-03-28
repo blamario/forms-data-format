@@ -94,7 +94,7 @@ updateField (root :| path) old new x@Field{name, content}
   | otherwise = case nonEmpty path of
       Nothing
         | Just v <- leafValue content, v /= old -> error ("Expected to update " <> show old <> ", instead found " <> show content)
-        | Just _ <- leafValue content -> x{content= setLeafValue content new}
+        | Just setter <- leafValueSetter content -> x{content= setter new}
         | otherwise -> error ("Expected to update " <> show old <> ", instead found " <> show content)
       Just path'
         | Children kids <- content -> x{content= Children $ updateAmong path' old new kids}
@@ -106,13 +106,12 @@ leafValue (FieldValue v)     = Just v
 leafValue (FieldNameValue v) = Just v
 leafValue (Children _)       = Nothing
 
--- | Replace the text value of a leaf 'FieldContent', preserving its type.
--- 'Children' nodes are returned unchanged (the new value is discarded because
--- only leaf fields carry a @\/V@ entry).
-setLeafValue :: FieldContent -> Text -> FieldContent
-setLeafValue (FieldValue _)     new = FieldValue new
-setLeafValue (FieldNameValue _) new = FieldNameValue new
-setLeafValue (Children kids)    _   = Children kids
+-- | Return a setter for the text value of a leaf 'FieldContent' that preserves
+-- its type, or 'Nothing' for 'Children' nodes.
+leafValueSetter :: FieldContent -> Maybe (Text -> FieldContent)
+leafValueSetter (FieldValue _)     = Just FieldValue
+leafValueSetter (FieldNameValue _) = Just FieldNameValue
+leafValueSetter (Children _)       = Nothing
 
 insertAmong :: NonEmpty Text -> Text -> [Field] -> [Field]
 insertAmong path@(root :| _) new (x@Field{name} : xs)

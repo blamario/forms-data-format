@@ -15,11 +15,12 @@ import Text.FDF.PDF (parsePDF, fillPDF)
 -- ---------------------------------------------------------------------------
 -- Minimal test PDF construction
 
--- | Build a minimal valid PDF-1.4 byte string from a list of
---   @(objectNumber, generation, content)@ triples.
-makePDF :: [(Int, Int, BS.ByteString)] -> BS.ByteString
-makePDF objects =
+-- | Build a minimal valid PDF-1.4 byte string from a list of object bodies.
+-- Objects are numbered starting from 1 with generation 0.
+makePDF :: [BS.ByteString] -> BS.ByteString
+makePDF contents =
   let header  = "%PDF-1.4\n"
+      objects = zip [1..] contents
       (body, offsets) = foldl' addObj (header, []) objects
       xrefOff = BS.length body
       nObjs   = length objects
@@ -33,8 +34,8 @@ makePDF objects =
                   <> show xrefOff <> "\n%%EOF\n"
   in body <> xref <> trailer
   where
-    addObj (acc, offs) (n, g, content) =
-      let objBS = BSC.pack (show n <> " " <> show g <> " obj\n")
+    addObj (acc, offs) (n, content) =
+      let objBS = BSC.pack (show (n :: Int) <> " 0 obj\n")
                   <> content <> "\nendobj\n"
       in (acc <> objBS, BS.length acc : offs)
     padDec10 n =
@@ -43,12 +44,12 @@ makePDF objects =
 -- | A minimal PDF with a single text field @TextField1@ with value @Hello@.
 simplePDF :: BS.ByteString
 simplePDF = makePDF
-  [ (1, 0, "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>")
-  , (2, 0, "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>")
-  , (3, 0, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [ 6 0 R ] >>")
-  , (4, 0, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
-  , (5, 0, "<< /Fields [ 6 0 R ] /DR << /Font << /Helv 4 0 R >> >> >>")
-  , (6, 0, "<< /Type /Annot /Subtype /Widget /FT /Tx /T (TextField1) /V (Hello) /Rect [100 700 400 720] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>")
+  [ "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>"
+  , "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>"
+  , "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [ 6 0 R ] >>"
+  , "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+  , "<< /Fields [ 6 0 R ] /DR << /Font << /Helv 4 0 R >> >> >>"
+  , "<< /Type /Annot /Subtype /Widget /FT /Tx /T (TextField1) /V (Hello) /Rect [100 700 400 720] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>"
   ]
 
 -- | Like 'simplePDF' but the field @\/Rect@ uses fractional coordinates
@@ -57,13 +58,13 @@ simplePDF = makePDF
 -- \"Unexpected character: e\" bug in @serializeValue@ / @parseNumOrRef@.
 floatRectPDF :: BS.ByteString
 floatRectPDF = makePDF
-  [ (1, 0, "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>")
-  , (2, 0, "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>")
-  , (3, 0, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [ 6 0 R ] >>")
-  , (4, 0, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
-  , (5, 0, "<< /Fields [ 6 0 R ] /DR << /Font << /Helv 4 0 R >> >> >>")
+  [ "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>"
+  , "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>"
+  , "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [ 6 0 R ] >>"
+  , "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+  , "<< /Fields [ 6 0 R ] /DR << /Font << /Helv 4 0 R >> >> >>"
   -- /Rect uses 0.05 – a value whose show representation is "5.0e-2"
-  , (6, 0, "<< /Type /Annot /Subtype /Widget /FT /Tx /T (FloatField) /V (Hi) /Rect [0.05 0.05 200.05 12.05] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>")
+  , "<< /Type /Annot /Subtype /Widget /FT /Tx /T (FloatField) /V (Hi) /Rect [0.05 0.05 200.05 12.05] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>"
   ]
 
 -- | A minimal PDF with a radio button group (initially unselected: @\/V \/@)
@@ -71,18 +72,18 @@ floatRectPDF = makePDF
 -- key, which is the pattern that caused the original bug.
 radioPDF :: BS.ByteString
 radioPDF = makePDF
-  [ (1, 0, "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>")
-  , (2, 0, "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>")
-  , (3, 0, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [ 7 0 R 8 0 R 9 0 R ] >>")
-  , (4, 0, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
-  , (5, 0, "<< /Fields [ 6 0 R 9 0 R ] /DR << /Font << /Helv 4 0 R >> >> >>")
+  [ "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>"
+  , "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>"
+  , "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [ 7 0 R 8 0 R 9 0 R ] >>"
+  , "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+  , "<< /Fields [ 6 0 R 9 0 R ] /DR << /Font << /Helv 4 0 R >> >> >>"
   -- Radio group: /V / means empty-name selection (unselected)
-  , (6, 0, "<< /FT /Btn /Ff 49152 /T (RadioGroup) /V / /Kids [ 7 0 R 8 0 R ] >>")
+  , "<< /FT /Btn /Ff 49152 /T (RadioGroup) /V / /Kids [ 7 0 R 8 0 R ] >>"
   -- Widget annotations without /T (anonymous)
-  , (7, 0, "<< /Type /Annot /Subtype /Widget /Parent 6 0 R /Rect [100 700 120 720] /P 3 0 R /AS /Off >>")
-  , (8, 0, "<< /Type /Annot /Subtype /Widget /Parent 6 0 R /Rect [150 700 170 720] /P 3 0 R /AS /Off >>")
+  , "<< /Type /Annot /Subtype /Widget /Parent 6 0 R /Rect [100 700 120 720] /P 3 0 R /AS /Off >>"
+  , "<< /Type /Annot /Subtype /Widget /Parent 6 0 R /Rect [150 700 170 720] /P 3 0 R /AS /Off >>"
   -- Text field
-  , (9, 0, "<< /Type /Annot /Subtype /Widget /FT /Tx /T (TextField1) /V (InitVal) /Rect [100 650 400 670] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>")
+  , "<< /Type /Annot /Subtype /Widget /FT /Tx /T (TextField1) /V (InitVal) /Rect [100 650 400 670] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>"
   ]
 
 -- ---------------------------------------------------------------------------

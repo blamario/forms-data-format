@@ -724,13 +724,27 @@ unfilterRow filt rawRow prevRow =
 -- Object loading
 
 -- | Load and dereference an object.  References are followed one level deep.
+-- For objects at a byte offset (@XRefOffset@) in an encrypted PDF, all
+-- 'PDFString' leaf values in the result are decrypted with @dec@ using the
+-- per-object key (objNum, genNum).  Objects within an object stream
+-- (@XRefObjStm@) do not need per-string decryption because the stream itself
+-- is already decrypted before parsing (per PDF spec §7.6.5).
 loadObject :: ByteString -> XRef -> Decryptor -> PDFValue -> Either String PDFValue
-loadObject bs xref dec (PDFRef n _) =
+loadObject bs xref dec (PDFRef n g) =
   case IntMap.lookup n xref of
     Nothing                 -> Left $ "Object " <> show n <> " not in xref"
-    Just (XRefOffset off)   -> parseIndirectObject bs off
+    Just (XRefOffset off)   -> parseIndirectObject bs off >>= decryptPDFValue dec n g
     Just (XRefObjStm sn ix) -> loadFromObjStream bs xref dec sn ix
 loadObject _ _ _ v = Right v
+
+-- | Recursively decrypt all 'PDFString' leaf values in a 'PDFValue' using the
+-- supplied 'Decryptor' with the given per-object (@objNum@, @genNum@) key.
+-- 'noDecrypt' makes this a no-op for unencrypted PDFs.
+decryptPDFValue :: Decryptor -> Int -> Int -> PDFValue -> Either String PDFValue
+decryptPDFValue dec n g (PDFString bs) = PDFString <$> dec n g bs
+decryptPDFValue dec n g (PDFArray vs)  = PDFArray  <$> mapM (decryptPDFValue dec n g) vs
+decryptPDFValue dec n g (PDFDict d)    = PDFDict   <$> mapM (decryptPDFValue dec n g) d
+decryptPDFValue _   _ _ v              = Right v
 
 -- | Load an object that must be a dictionary.
 loadDict :: ByteString -> XRef -> Decryptor -> (Int, Int) -> Either String (Map ByteString PDFValue)

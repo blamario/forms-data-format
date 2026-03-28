@@ -49,7 +49,7 @@ import qualified Text.FDF as FDF
 -- object streams.
 parsePDF :: ByteString -> Either String FDF
 parsePDF bs = do
-  (_, xref, trailer, dec, fieldsArr) <- loadAcroFormFields bs
+  (_, xref, trailer, dec, _enc, fieldsArr) <- loadAcroFormFields bs
   fields <- catMaybes <$> mapM (loadFieldObj bs xref dec) fieldsArr
   case fields of
     []  -> Left "PDF has no AcroForm fields"
@@ -66,12 +66,12 @@ parsePDF bs = do
 --
 -- Uses an incremental-update append so the original PDF bytes are left intact.
 -- For encrypted PDFs (Standard Security Handler, empty user password), the
--- new field-value objects are written with plaintext string values; the
--- original body objects remain encrypted and the new trailer carries both
--- @\/Encrypt@ and @\/ID@ so readers can still decrypt them.
+-- new field-value objects are AES-encrypted with the same key as the original
+-- body; the incremental update trailer carries both @\/Encrypt@ and @\/ID@ so
+-- readers can decrypt both the original body objects and the new field objects.
 fillPDF :: FDF -> ByteString -> Either String ByteString
 fillPDF fdf pdfBytes = do
-  (xrefOff, xref, trailer, dec, fieldsArr) <- loadAcroFormFields pdfBytes
+  (xrefOff, xref, trailer, dec, enc, fieldsArr) <- loadAcroFormFields pdfBytes
   -- Build mapping:  full path → (objNum, current dict)
   pathMap      <- buildPathMap pdfBytes xref dec [] fieldsArr
   -- Collect leaf-value updates from FDF
@@ -83,24 +83,24 @@ fillPDF fdf pdfBytes = do
   (newObjs, _) <- foldl' (applyUpdate pathMap) (Right ([], totalObjs)) updates
   Right $ if null newObjs
     then pdfBytes
-    else appendIncrementalUpdate pdfBytes xrefOff trailer newObjs
+    else appendIncrementalUpdate enc pdfBytes xrefOff trailer newObjs
 
 -- | Parse the PDF cross-reference tables and locate the AcroForm @\/Fields@
 -- array, returning the xref offset, xref table, trailer dictionary,
--- decryptor, and field references.
+-- decryptor, encryptor, and field references.
 loadAcroFormFields
   :: ByteString
-  -> Either String (Int64, XRef, Map ByteString PDFValue, Decryptor, [PDFValue])
+  -> Either String (Int64, XRef, Map ByteString PDFValue, Decryptor, Encryptor, [PDFValue])
 loadAcroFormFields bs = do
   xrefOff         <- findXRefOffset bs
   (xref, trailer) <- parseXRefChain bs xrefOff
-  dec             <- buildDecryptor bs xref trailer
+  (dec, enc)      <- buildDecryptor bs xref trailer
   rootRef         <- dictLookupRef "Root" trailer
   catalog         <- loadDict bs xref dec rootRef
   acroRef         <- dictLookupRef "AcroForm" catalog
   acroForm        <- loadDict bs xref dec acroRef
   fieldsArr       <- loadArray bs xref dec "Fields" acroForm
-  return (xrefOff, xref, trailer, dec, fieldsArr)
+  return (xrefOff, xref, trailer, dec, enc, fieldsArr)
 
 -- ---------------------------------------------------------------------------
 -- PDF value types
@@ -1009,15 +1009,16 @@ applyUpdate pathMap (Right (objs, maxN)) (path, newVal) =
 
 -- | Append new object versions and an updated xref/trailer to @pdfBytes@.
 appendIncrementalUpdate
-  :: ByteString
+  :: Encryptor
+  -> ByteString
   -> Int64                                           -- previous xref offset
   -> Map ByteString PDFValue                         -- original trailer
   -> [(ObjRef, Map ByteString PDFValue)]             -- updated objects
   -> ByteString
-appendIncrementalUpdate pdfBytes prevXrefOff origTrailer updatedObjs =
+appendIncrementalUpdate enc pdfBytes prevXrefOff origTrailer updatedObjs =
   let baseLen  = fromIntegral (BS.length pdfBytes)
       -- Serialize each updated object and record its new offset.
-      (objBlocks, offsets) = buildObjBlocks baseLen updatedObjs
+      (objBlocks, offsets) = buildObjBlocks enc baseLen updatedObjs
       -- Build new xref section.
       newXrefOff           = baseLen + fromIntegral (LBS.length (BB.toLazyByteString (mconcat objBlocks)))
       newXref              = buildXRefSection offsets
@@ -1038,13 +1039,14 @@ appendIncrementalUpdate pdfBytes prevXrefOff origTrailer updatedObjs =
 
 -- | Serialize updated objects and return (BB blocks, (objRef, offset) list).
 buildObjBlocks
-  :: Int64
+  :: Encryptor
+  -> Int64
   -> [(ObjRef, Map ByteString PDFValue)]
   -> ([BB.Builder], [(ObjRef, Int64)])
-buildObjBlocks startOff objs =
+buildObjBlocks enc startOff objs =
   let go off [] = ([], [])
       go off ((ref@(n,g), dict) : rest) =
-        let block   = serializeObj n g dict
+        let block   = serializeObj n g (encryptPDFValues enc n g dict)
             blockBS = LBS.toStrict (BB.toLazyByteString block)
             len     = fromIntegral (BS.length blockBS)
             (blocks, offsets) = go (off + len) rest

@@ -5,7 +5,7 @@
 
 -- | Parse and serialize between FDF files and `Map [Text] Text`.
 
-module Text.FDF (FDF (FDF, body), Field (Field, name, content), FieldContent (FieldValue, Children),
+module Text.FDF (FDF (FDF, body), Field (Field, name, content), FieldContent (FieldValue, FieldNameValue, Children),
                  insert, delete, update,
                  mapWithKey, mapFieldWithKey,
                  foldMapWithKey, foldMapFieldWithKey,
@@ -48,6 +48,7 @@ data Field = Field {
 
 data FieldContent
   = FieldValue Text
+  | FieldNameValue Text    -- ^ a PDF name value, serialized as @\/V \/name@
   | Children [Field]
   deriving (Show, Eq, Ord)
 
@@ -68,10 +69,11 @@ insertField (root :| path) new x@Field{name, content}
   | root /= name = error ("Insertion name mismatch: " <> show root <> "/=" <> show name)
   | otherwise = case nonEmpty path of
       Nothing
-        | FieldValue old <- content -> error ("Insertion would overwrite value: " <> show old <> "->" <> show new)
+        | Just old <- leafValue content -> error ("Insertion would overwrite value: " <> show old <> "->" <> show new)
         | otherwise -> error ("Insertion would prune " <> show root)
       Just path' -> case content of
-        FieldValue old -> error ("Insertion ran out " <> show (root : path))
+        FieldValue _     -> error ("Insertion ran out " <> show (root : path))
+        FieldNameValue _ -> error ("Insertion ran out " <> show (root : path))
         Children kids -> x{content= Children $ insertAmong path' new kids}
 
 deleteField :: NonEmpty Text -> Text -> Field -> Field
@@ -80,7 +82,8 @@ deleteField (root :| path) old x@Field{name, content}
   | otherwise = case nonEmpty path of
       Nothing
         | Children{} <- content -> error ("Deletion would prune " <> show root)
-        | content /= FieldValue old -> error ("Expected to delete " <> show old <> ", instead found " <> show content)
+        | Just v <- leafValue content, v == old -> x  -- will be removed by deleteAmong
+        | otherwise -> error ("Expected to delete " <> show old <> ", instead found " <> show content)
       Just path'
         | Children kids <- content -> x{content= Children $ deleteAmong path' old kids}
         | otherwise -> error ("Deletion ran out " <> show root)
@@ -90,10 +93,25 @@ updateField (root :| path) old new x@Field{name, content}
   | root /= name = error ("Update name mismatch: " <> show root <> "/=" <> show name)
   | otherwise = case nonEmpty path of
       Nothing
-        | content /= FieldValue old -> error ("Expected to update " <> show old <> ", instead found " <> show content)
-        | otherwise -> x{content= FieldValue new}
+        | Just v <- leafValue content, v /= old -> error ("Expected to update " <> show old <> ", instead found " <> show content)
+        | Just setter <- leafValueSetter content -> x{content= setter new}
+        | otherwise -> error ("Expected to update " <> show old <> ", instead found " <> show content)
       Just path'
         | Children kids <- content -> x{content= Children $ updateAmong path' old new kids}
+        | otherwise -> error ("Update ran out " <> show root)
+
+-- | Extract the text value from a leaf 'FieldContent', if any.
+leafValue :: FieldContent -> Maybe Text
+leafValue (FieldValue v)     = Just v
+leafValue (FieldNameValue v) = Just v
+leafValue (Children _)       = Nothing
+
+-- | Return a setter for the text value of a leaf 'FieldContent' that preserves
+-- its type, or 'Nothing' for 'Children' nodes.
+leafValueSetter :: FieldContent -> Maybe (Text -> FieldContent)
+leafValueSetter (FieldValue _)     = Just FieldValue
+leafValueSetter (FieldNameValue _) = Just FieldNameValue
+leafValueSetter (Children _)       = Nothing
 
 insertAmong :: NonEmpty Text -> Text -> [Field] -> [Field]
 insertAmong path@(root :| _) new (x@Field{name} : xs)
@@ -107,8 +125,8 @@ deleteAmong :: NonEmpty Text -> Text -> [Field] -> [Field]
 deleteAmong path@(root :| rest) old (x@Field{name, content} : xs)
   | root /= name = x : deleteAmong path old xs
   | Just path' <- nonEmpty rest = deleteField path' old x : xs
-  | content /= FieldValue old = error ("Expected to delete " <> show old <> ", instead found " <> show content)
-  | otherwise = xs
+  | Just v <- leafValue content, v == old = xs
+  | otherwise = error ("Expected to delete " <> show old <> ", instead found " <> show content)
 deleteAmong path _ [] = error ("Can't find the path to delete, " <> show path)
 
 updateAmong :: NonEmpty Text -> Text -> Text -> [Field] -> [Field]
@@ -122,6 +140,7 @@ mapWithKey f x@FDF{body} = x{body = mapFieldWithKey f body}
 
 mapFieldWithKey :: ([Text] -> Text -> Text) -> Field -> Field
 mapFieldWithKey f x@Field{name, content=FieldValue v} = x{content = FieldValue $ f [name] v}
+mapFieldWithKey f x@Field{name, content=FieldNameValue v} = x{content = FieldNameValue $ f [name] v}
 mapFieldWithKey f x@Field{name, content=Children kids} = x{content = Children $ mapFieldWithKey (f . (name:)) <$> kids}
 
 foldMapWithKey :: Monoid a => ([Text] -> Text -> a) -> FDF -> a
@@ -129,6 +148,7 @@ foldMapWithKey f x@FDF{body} = foldMapFieldWithKey f body
 
 foldMapFieldWithKey :: Monoid a => ([Text] -> Text -> a) -> Field -> a
 foldMapFieldWithKey f Field{name, content = FieldValue v} = f [name] v
+foldMapFieldWithKey f Field{name, content = FieldNameValue v} = f [name] v
 foldMapFieldWithKey f Field{name, content = Children kids} = foldMap (foldMapFieldWithKey $ f . (name:)) kids
 
 traverseWithKey :: Applicative f => ([Text] -> Text -> f Text) -> FDF -> f FDF
@@ -136,6 +156,7 @@ traverseWithKey f x@FDF{body} = (\body'-> x{body = body'}) <$> traverseFieldWith
 
 traverseFieldWithKey :: Applicative f => ([Text] -> Text -> f Text) -> Field -> f Field
 traverseFieldWithKey f Field{name, content = FieldValue v} = Field name . FieldValue <$> f [name] v
+traverseFieldWithKey f Field{name, content = FieldNameValue v} = Field name . FieldNameValue <$> f [name] v
 traverseFieldWithKey f Field{name, content = Children kids} =
   Field name . Children <$> traverse (traverseFieldWithKey $ f . (name:)) kids
 
@@ -159,6 +180,11 @@ serializeField Field{name, content = FieldValue v} =
   "<<\n"
   <> "/T (" <> encodeUtf8 name <> ")\n"
   <> "/V (" <> serializeValue v <> ")\n"
+  <> ">>"
+serializeField Field{name, content = FieldNameValue v} =
+  "<<\n"
+  <> "/T (" <> encodeUtf8 name <> ")\n"
+  <> "/V /" <> encodeUtf8 v <> "\n"
   <> ">>"
 serializeField Field{name, content = Children kids} =
   "<<\n"
@@ -210,16 +236,18 @@ parser = FDF
 field :: Parser ByteStringUTF8 Field
 field = Field <$ begin
   <*> strictText (string "/T (" *> takeCharsWhile (`notElem` [')', '\r', '\n']) <* string ")" <* lineEnd <?> "name")
-  <*> (FieldValue <$> fieldValue <|> Children <$> children)
+  <*> (FieldValue <$> fieldStringValue <|> FieldNameValue <$> fieldNameValue <|> Children <$> children)
   <* end
   where
-    fieldValue = strictText $
+    fieldStringValue = strictText $
                  admit (string "/V ("
                         *> commit ((string (ByteStringUTF8 utf16beBOM) *> (utf8from16 <$> Text.Grampa.takeWhile (/= ")"))
                                     <|> concatMany (takeCharsWhile1 (`notElem` [')', '\r', '\n', '\\']) <|> escape))
                                    <* string ")" <* lineEnd)
-                        <|> string "/V /" *> commit (takeCharsWhile (`notElem` ['\r', '\n']) <* lineEnd)
-                        <?> "value")
+                        <?> "string value")
+    fieldNameValue = strictText $
+                 admit (string "/V /" *> commit (takeCharsWhile (`notElem` ['\r', '\n']) <* lineEnd)
+                        <?> "name value")
     children = admit (string "/Kids [" *> commit (lineEnd *> takeSome field <* string "]" <* lineEnd <?> "kids")
                       <|> commit mempty)
     escape = char '\\'

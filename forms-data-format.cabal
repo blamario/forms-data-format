@@ -1,8 +1,8 @@
 cabal-version:      2.4
 name:               forms-data-format
-version:            0.3
+version:            0.4
 
-synopsis: Parse and serialize FDF, the Forms Data Format
+synopsis: Parse, serialize, and manipulate FDF: the Forms Data Format
 
 description: This is a hacked-together library to parse and serialize FDF,
              Adobe's [Forms Data
@@ -25,11 +25,16 @@ source-repository head
 
 library
     exposed-modules:  Text.FDF
+                      Text.FDF.PDF
 
     -- Modules included in this library but not exported.
     -- other-modules:
-    other-extensions: ImportQualifiedPost NamedFieldPuns OverloadedStrings
+    other-extensions: ImportQualifiedPost LambdaCase NamedFieldPuns OverloadedStrings
     build-depends:    base == 4.*, bytestring >=0.9 && < 0.13, text >= 2.0.2 && < 2.2,
+                      containers >= 0.6 && < 0.9,
+                      zlib >= 0.6 && < 0.8,
+                      crypton >= 1.0 && < 2,
+                      ram >= 0.19 && < 0.22,
                       monoid-subclasses == 1.*, rank2classes >= 1 && < 1.6,
                       parsers < 0.13, grammatical-parsers >= 0.5 && < 0.8
     hs-source-dirs:   src
@@ -51,4 +56,28 @@ executable fdfpatch
     default-language: Haskell2010
     build-depends:    base == 4.*, bytestring, text,
                       directory >= 1.2 && < 1.4, optparse-applicative >= 0.15 && < 0.19,
+                      forms-data-format
+
+executable pdf-to-fdf
+    main-is:          PdfToFdf.hs
+    hs-source-dirs:   app
+    default-language: Haskell2010
+    build-depends:    base == 4.*, bytestring,
+                      optparse-applicative >= 0.15 && < 0.19,
+                      forms-data-format
+
+executable fdf-to-pdf
+    main-is:          FdfToPdf.hs
+    hs-source-dirs:   app
+    default-language: Haskell2010
+    build-depends:    base == 4.*, bytestring,
+                      optparse-applicative >= 0.15 && < 0.19,
+                      forms-data-format
+
+test-suite pdf-round-trip
+    type:             exitcode-stdio-1.0
+    main-is:          PdfRoundTrip.hs
+    hs-source-dirs:   test
+    default-language: Haskell2010
+    build-depends:    base == 4.*, bytestring,
                       forms-data-format

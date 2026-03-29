@@ -16,7 +16,7 @@ import Control.Applicative ((<*), (<*>), (<|>), many, some, optional)
 import Data.Bifunctor (bimap)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
-import Data.Char (chr, digitToInt, isAscii, isSpace, ord)
+import Data.Char (chr, digitToInt, isSpace, ord)
 import Data.List.NonEmpty (NonEmpty((:|)), nonEmpty)
 import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
 import Data.Monoid.Textual (singleton, toString, toText)
@@ -144,7 +144,7 @@ mapFieldWithKey f x@Field{name, content=FieldNameValue v} = x{content = FieldNam
 mapFieldWithKey f x@Field{name, content=Children kids} = x{content = Children $ mapFieldWithKey (f . (name:)) <$> kids}
 
 foldMapWithKey :: Monoid a => ([Text] -> Text -> a) -> FDF -> a
-foldMapWithKey f x@FDF{body} = foldMapFieldWithKey f body
+foldMapWithKey f FDF{body} = foldMapFieldWithKey f body
 
 foldMapFieldWithKey :: Monoid a => ([Text] -> Text -> a) -> Field -> a
 foldMapFieldWithKey f Field{name, content = FieldValue v} = f [name] v

@@ -26,9 +26,11 @@ source-repository head
 library
     exposed-modules:  Text.FDF
                       Text.FDF.PDF
-    other-modules:    Text.FDF.PDF.Decrypt
+    other-modules:    Text.FDF.PDF.Decompress
+                      Text.FDF.PDF.Decrypt
                       Text.FDF.PDF.Parse
                       Text.FDF.PDF.Types
+                      Text.FDF.PDF.XRef
 
     -- Modules included in this library but not exported.
     -- other-modules:

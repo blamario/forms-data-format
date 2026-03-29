@@ -31,3 +31,8 @@ data XRefEntry
 
 -- | Cross-reference table: maps object number to its location.
 type XRef = IntMap XRefEntry
+
+-- | Convert a 'PDFValue' to an 'Int', failing with a message otherwise.
+toInt :: PDFValue -> Either String Int
+toInt (PDFInt n) = Right n
+toInt v          = Left $ "Expected integer, got: " <> show v

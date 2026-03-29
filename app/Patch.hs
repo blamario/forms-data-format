@@ -69,5 +69,5 @@ process options = do
 main :: IO ()
 main =
   OptsAp.execParser (OptsAp.info optionsParser
-                     $ OptsAp.progDesc "Output the difference between two input FDF files")
+                     $ OptsAp.progDesc "Patch the input FDF file with the given diff")
   >>= process

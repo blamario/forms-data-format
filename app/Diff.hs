@@ -62,6 +62,10 @@ diff oldPaths ignorable ancestry old new
   | otherwise = diffContents oldPaths ignorable (ancestry ++ [old.name]) old.content new.content
 
 diffContents :: Bool -> (Text -> Bool) -> [Text] -> FDF.FieldContent -> FDF.FieldContent -> [([Text], Difference)]
+diffContents oldPaths ignorable ancestry (FDF.FieldNameValue old) new =
+  diffContents oldPaths ignorable ancestry (FDF.FieldValue old) new
+diffContents oldPaths ignorable ancestry old (FDF.FieldNameValue new) =
+  diffContents oldPaths ignorable ancestry old (FDF.FieldValue new)
 diffContents oldPaths ignorable ancestry (FDF.FieldValue old) (FDF.FieldValue new)
   | old == new = []
   | otherwise = [(ancestry, Change old new)]
@@ -97,6 +101,7 @@ list addAncestry x = listContent (addAncestry . (x.name :)) x.content
 
 listContent :: ([Text] -> [Text]) -> FDF.FieldContent -> [([Text], Text)]
 listContent addAncestry (FDF.FieldValue v) = [(addAncestry [], v)]
+listContent addAncestry (FDF.FieldNameValue v) = [(addAncestry [], v)]
 listContent addAncestry (FDF.Children kids) = foldMap (list addAncestry) (List.sort kids)
 
 hasNonemptyValue :: Difference -> Bool

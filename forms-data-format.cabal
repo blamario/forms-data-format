@@ -29,6 +29,7 @@ library
     other-modules:    Text.FDF.PDF.Decompress
                       Text.FDF.PDF.Decrypt
                       Text.FDF.PDF.Parse
+                      Text.FDF.PDF.Serialize
                       Text.FDF.PDF.Types
                       Text.FDF.PDF.XRef
 

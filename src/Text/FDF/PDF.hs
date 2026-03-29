@@ -12,7 +12,7 @@
 -- * §12.7 – Interactive forms (AcroForm, field dictionaries, @\/Kids@, @\/T@, @\/V@)
 --
 -- The module is intentionally self-contained (no external PDF library dependency).
--- Future work may split the low-level parsing helpers into a separate internal module.
+
 module Text.FDF.PDF
   ( parsePDF
   , fillPDF
@@ -26,11 +26,9 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as LBS
 import qualified Codec.Compression.Zlib as Zlib
-import Data.Bits (shiftR)
-import Data.Char (chr, intToDigit, isDigit, isHexDigit, isSpace, ord)
+import Data.Char (intToDigit, isDigit, isSpace)
 import Numeric (showFFloat)
 import Data.Int (Int64)
-import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.List (foldl')
 import Data.List.NonEmpty (NonEmpty)
@@ -43,14 +41,11 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Word (Word8)
 import System.IO.Unsafe (unsafePerformIO)
-import qualified Crypto.Hash as CHash
-import qualified Crypto.Cipher.AES as CAES
-import qualified Crypto.Cipher.Types as CCipher
-import qualified Crypto.Error as CError
-import qualified Data.ByteArray as BA
 
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
-import qualified Text.FDF as FDF
+import Text.FDF.PDF.Decrypt (Decryptor, Encryptor, buildDecryptor)
+import Text.FDF.PDF.Parse
+import Text.FDF.PDF.Types
 
 -- | Extract form field data from a PDF file.
 --
@@ -112,254 +107,6 @@ loadAcroFormFields bs = do
   acroForm        <- loadDict bs xref dec acroRef
   fieldsArr       <- loadArray bs xref dec "Fields" acroForm
   return (xrefOff, xref, trailer, dec, enc, fieldsArr)
-
--- ---------------------------------------------------------------------------
--- PDF value types
-
-data PDFValue
-  = PDFNull
-  | PDFBool Bool
-  | PDFInt Int
-  | PDFReal Double
-  | PDFName ByteString          -- without leading '/'
-  | PDFString ByteString        -- decoded raw bytes (may be UTF-16BE)
-  | PDFArray [PDFValue]
-  | PDFDict (Map ByteString PDFValue)
-  | PDFRef Int Int              -- object number, generation number
-  deriving (Eq, Show)
-
--- ---------------------------------------------------------------------------
--- XRef
-
--- | A single cross-reference entry.
-data XRefEntry
-  = XRefOffset Int64   -- ^ byte offset of the object in the file
-  | XRefObjStm Int Int -- ^ compressed: (object stream obj number, index in stream)
-  deriving (Eq, Show)
-
--- | Cross-reference table: maps object number to its location.
-type XRef = IntMap XRefEntry
-
--- ---------------------------------------------------------------------------
--- Stream decryption (PDF Standard Security Handler, R=4, AES-128-CBC)
-
--- | A stream decryptor: given @(objectNumber, generationNumber, rawCiphertext)@
--- returns the decrypted bytes.  The no-op 'noDecrypt' is used for unencrypted PDFs.
-type Decryptor = Int -> Int -> ByteString -> Either String ByteString
-
--- | No-op decryptor for unencrypted PDFs.
-noDecrypt :: Decryptor
-noDecrypt _ _ bs = Right bs
-
--- | Build a 'Decryptor' and matching 'Encryptor' from the trailer dictionary.
--- Returns 'noDecrypt' / 'noEncrypt' for unencrypted PDFs.
--- Only the Standard Security Handler with @\/V 4@ \/ @\/R ≥ 3@ (AES-128-CBC)
--- and an empty user password is currently supported.
-buildDecryptor
-  :: ByteString
-  -> XRef
-  -> Map ByteString PDFValue
-  -> Either String (Decryptor, Encryptor)
-buildDecryptor bs xref trailer =
-  case Map.lookup "Encrypt" trailer of
-    Nothing -> Right (noDecrypt, noEncrypt)
-    Just (PDFRef n g) -> do
-      encDict <- loadEncryptDict bs xref n g
-      buildDecryptorFromDict encDict trailer
-    Just (PDFDict encDict) -> buildDecryptorFromDict encDict trailer
-    _ -> Left "Invalid /Encrypt entry in trailer"
-
--- | Build a 'Decryptor' and 'Encryptor' from a parsed /Encrypt dictionary.
-buildDecryptorFromDict
-  :: Map ByteString PDFValue
-  -> Map ByteString PDFValue
-  -> Either String (Decryptor, Encryptor)
-buildDecryptorFromDict encDict trailer = do
-  case Map.lookup "Filter" encDict of
-    Just (PDFName "Standard") -> return ()
-    Just f -> Left ("Unsupported encryption filter: " <> show f)
-    Nothing -> Left "Encrypt dict missing /Filter"
-  -- Extract first element of /ID array as the file identifier.
-  fileId <- case Map.lookup "ID" trailer of
-    Just (PDFArray (PDFString i : _)) -> Right i
-    _ -> Left "Trailer /ID missing or not an array of strings"
-  key <- computeFileEncKey encDict fileId
-  Right (makeAESDecryptor key, makeAESEncryptor key)
-
--- | Load the Encrypt dictionary by direct offset (it is never itself
--- encrypted, so no decryptor is needed).
-loadEncryptDict :: ByteString -> XRef -> Int -> Int -> Either String (Map ByteString PDFValue)
-loadEncryptDict bs xref n _genNum =
-  case IntMap.lookup n xref of
-    Nothing -> Left $ "Encrypt object " <> show n <> " not in xref"
-    Just (XRefOffset off) -> do
-      v <- parseIndirectObject bs off
-      case v of
-        PDFDict d -> Right d
-        _ -> Left "Encrypt object is not a dictionary"
-    Just (XRefObjStm _ _) -> Left "Encrypt dict inside an ObjStm (not supported)"
-
--- | Compute the 16-byte file encryption key for the empty user password using
--- the Standard Security Handler algorithm (PDF spec §7.6.3.3, Algorithm 2).
--- This handles R=3 and R=4 (the iterations step).
-computeFileEncKey
-  :: Map ByteString PDFValue   -- ^ the @\/Encrypt@ dictionary
-  -> ByteString                -- ^ first element of the @\/ID@ array
-  -> Either String ByteString
-computeFileEncKey encDict fileId = do
-  p <- case Map.lookup "P" encDict of
-         Just (PDFInt n) -> Right n
-         _ -> Left "Encrypt dict missing /P"
-  oVal <- case Map.lookup "O" encDict of
-            Just (PDFString s) -> Right s
-            _ -> Left "Encrypt dict missing /O"
-  let n        = 16   -- AES-128 key: 128 bits / 8
-      -- Step a: pad empty password to 32 bytes using the standard padding string.
-      padded   = BS.take 32 (pdfPasswordPadding <> BS.replicate 32 0)
-      -- Step d: pack P as signed 32-bit little-endian.
-      p32      = BS.pack [ fromIntegral  p
-                         , fromIntegral (p `shiftR`  8)
-                         , fromIntegral (p `shiftR` 16)
-                         , fromIntegral (p `shiftR` 24) ]
-      -- Steps b–e: MD5(padded_password ++ O ++ P_LE ++ FileID).
-      h0       = md5Hash (padded <> BS.take 32 oVal <> p32 <> fileId)
-      -- Step g: for R≥3, iterate MD5 50 more times (truncating to n bytes each round).
-      key      = foldl' (\acc _ -> md5Hash (BS.take n acc)) h0 ([1..50] :: [Int])
-  Right (BS.take n key)
-
--- | Standard 32-byte password padding string (PDF spec §7.6.3.3).
-pdfPasswordPadding :: ByteString
-pdfPasswordPadding = BS.pack
-  [ 0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41
-  , 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08
-  , 0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80
-  , 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A ]
-
--- | Build a stream 'Decryptor' that uses AES-128-CBC with per-object keys
--- derived from the given file encryption key (PDF spec §7.6.2, Algorithm 1
--- for AES streams).
-makeAESDecryptor :: ByteString -> Decryptor
-makeAESDecryptor fileKey objNum genNum rawStream
-  | BS.length rawStream < 16 = Left "Encrypted stream too short for AES-IV"
-  | otherwise =
-      let -- Per-object key: MD5(fileKey ++ objNum[3LE] ++ genNum[2LE] ++ "sAlT")
-          perObjKey = BS.take 16 $ md5Hash $
-                        fileKey
-                        <> BS.pack [ lo objNum, md objNum, hi objNum ]
-                        <> BS.pack [ lo genNum, md genNum ]
-                        <> "sAlT"
-          iv  = BS.take 16 rawStream
-          ct  = BS.drop 16 rawStream
-      in aes128CbcDecrypt perObjKey iv ct
-  where
-    lo n = fromIntegral  n
-    md n = fromIntegral (n `shiftR`  8)
-    hi n = fromIntegral (n `shiftR` 16)
-
--- | Compute the MD5 hash of a 'ByteString', returning the result as a
--- 16-byte 'ByteString'.
---
--- We obtain the hash via 'show' (which produces lowercase hex) and convert
--- back to bytes, avoiding any 'ByteArray'/'ByteArrayAccess' typeclass issues
--- between 'crypton' and 'memory'.
-md5Hash :: ByteString -> ByteString
-md5Hash bs =
-  let hexStr = BSC.pack (show (CHash.hashWith CHash.MD5 bs))
-  in BS.pack [ fromIntegral (hexDigit (BSC.index hexStr (2 * i)) * 16
-                           + hexDigit (BSC.index hexStr (2 * i + 1)))
-             | i <- [0 .. 15] ]
-
--- | AES-128-CBC decrypt, then strip PKCS#7 padding.
--- Converts all ByteStrings to 'BA.Bytes' for the crypto operations to avoid
--- relying on the 'ByteArray ByteString' instance from the 'memory' package.
-aes128CbcDecrypt :: ByteString -> ByteString -> ByteString -> Either String ByteString
-aes128CbcDecrypt key iv ct =
-  let keyB = BA.convert key :: BA.Bytes
-  in case (CCipher.cipherInit keyB :: CError.CryptoFailable CAES.AES128) of
-       CError.CryptoPassed cipher ->
-         let ivB = BA.convert iv :: BA.Bytes
-         in case (CCipher.makeIV ivB :: Maybe (CCipher.IV CAES.AES128)) of
-              Nothing  -> Left "AES: invalid IV length"
-              Just iv' ->
-                let ctB  = BA.convert ct :: BA.Bytes
-                    plain :: BA.Bytes
-                    plain = CCipher.cbcDecrypt cipher iv' ctB
-                in Right (pkcs7Unpad (BS.pack (BA.unpack plain)))
-       CError.CryptoFailed err -> Left ("AES init error: " <> show err)
-
--- | Remove PKCS#7 padding from a decrypted block.
-pkcs7Unpad :: ByteString -> ByteString
-pkcs7Unpad bs
-  | BS.null bs = bs
-  | otherwise  =
-      let pad = fromIntegral (BS.last bs)
-      in if pad >= 1 && pad <= 16 && pad <= BS.length bs
-         then BS.dropEnd pad bs
-         else bs
-
--- | Add PKCS#7 padding to reach the next multiple of 16 bytes (1–16 bytes added).
-pkcs7Pad :: ByteString -> ByteString
-pkcs7Pad bs =
-  let padLen  = 16 - (BS.length bs `mod` 16)
-      padByte = fromIntegral padLen
-  in bs <> BS.replicate padLen padByte
-
--- | AES-128-CBC encrypt (no padding; caller must pre-pad to a block multiple).
-aes128CbcEncrypt :: ByteString -> ByteString -> ByteString -> ByteString
-aes128CbcEncrypt key iv plaintext =
-  let keyB = BA.convert key :: BA.Bytes
-  in case (CCipher.cipherInit keyB :: CError.CryptoFailable CAES.AES128) of
-       CError.CryptoPassed cipher ->
-         let ivB = BA.convert iv :: BA.Bytes
-         in case (CCipher.makeIV ivB :: Maybe (CCipher.IV CAES.AES128)) of
-              Nothing  -> plaintext  -- cannot happen: IV is always 16 bytes
-              Just iv' ->
-                let ptB :: BA.Bytes
-                    ptB = BA.convert plaintext
-                    ct :: BA.Bytes
-                    ct  = CCipher.cbcEncrypt cipher iv' ptB
-                in BS.pack (BA.unpack ct)
-       CError.CryptoFailed _ -> plaintext  -- cannot happen: key is always 16 bytes
-
--- | An object string encryptor: given (objectNumber, generationNumber, rawPlaintext)
--- returns the AES-128-CBC ciphertext with a 16-byte IV prepended.
--- The no-op 'noEncrypt' is used for unencrypted PDFs.
-type Encryptor = Int -> Int -> ByteString -> ByteString
-
--- | No-op encryptor for unencrypted PDFs.
-noEncrypt :: Encryptor
-noEncrypt _ _ bs = bs
-
--- | Build a string 'Encryptor' that uses AES-128-CBC with a deterministic IV
--- derived from the per-object key (via MD5).  The resulting format is:
--- @16-byte IV || AES-CBC(plaintext with PKCS#7 padding)@.
-makeAESEncryptor :: ByteString -> Encryptor
-makeAESEncryptor fileKey objNum genNum plaintext =
-  let perObjKey = BS.take 16 $ md5Hash $
-                    fileKey
-                    <> BS.pack [ lo objNum, md objNum, hi objNum ]
-                    <> BS.pack [ lo genNum, md genNum ]
-                    <> "sAlT"
-      -- Derive a deterministic IV from the per-object key so that it is
-      -- unique per object while remaining purely functional.
-      iv  = BS.take 16 (md5Hash (perObjKey <> "AES-IV"))
-      ct  = aes128CbcEncrypt perObjKey iv (pkcs7Pad plaintext)
-  in iv <> ct
-  where
-    lo n = fromIntegral  n
-    md n = fromIntegral (n `shiftR`  8)
-    hi n = fromIntegral (n `shiftR` 16)
-
--- | Encrypt all 'PDFString' leaf values in a dictionary using the given
--- 'Encryptor' (for a specific object number and generation number).
--- 'PDFName', 'PDFRef', and other non-string values are left unchanged.
-encryptPDFValues :: Encryptor -> Int -> Int -> Map ByteString PDFValue -> Map ByteString PDFValue
-encryptPDFValues enc n g = Map.map go
-  where
-    go (PDFString bs) = PDFString (enc n g bs)
-    go (PDFArray vs)  = PDFArray  (map go vs)
-    go (PDFDict d)    = PDFDict   (Map.map go d)
-    go v              = v
 
 -- ---------------------------------------------------------------------------
 -- Finding startxref
@@ -756,6 +503,17 @@ decryptPDFValue dec n g (PDFArray vs)  = PDFArray  <$> mapM (decryptPDFValue dec
 decryptPDFValue dec n g (PDFDict d)    = PDFDict   <$> mapM (decryptPDFValue dec n g) d
 decryptPDFValue _   _ _ v              = Right v
 
+-- | Encrypt all 'PDFString' leaf values in a dictionary using the given
+-- 'Encryptor' (for a specific object number and generation number).
+-- 'PDFName', 'PDFRef', and other non-string values are left unchanged.
+encryptPDFValues :: Encryptor -> Int -> Int -> Map ByteString PDFValue -> Map ByteString PDFValue
+encryptPDFValues enc n g = Map.map go
+  where
+    go (PDFString bs) = PDFString (enc n g bs)
+    go (PDFArray vs)  = PDFArray  (map go vs)
+    go (PDFDict d)    = PDFDict   (Map.map go d)
+    go v              = v
+
 -- | Load an object that must be a dictionary.
 loadDict :: ByteString -> XRef -> Decryptor -> (Int, Int) -> Either String (Map ByteString PDFValue)
 loadDict bs xref dec (n, g) = do
@@ -763,19 +521,6 @@ loadDict bs xref dec (n, g) = do
   case v of
     PDFDict d -> Right d
     _         -> Left $ "Object " <> show n <> " is not a dictionary"
-
--- | Parse the indirect object (@N G obj ... endobj@) at the given offset.
-parseIndirectObject :: ByteString -> Int64 -> Either String PDFValue
-parseIndirectObject bs off = do
-  let chunk = dropWS (BS.drop (fromIntegral off) bs)
-  -- Skip "N G obj"
-  let (_, r1) = BSC.span isDigit chunk           -- skip obj number
-      (_, r2) = BSC.span isDigit (dropWS r1)     -- skip generation
-      r3      = dropWS r2
-  after <- case BSC.stripPrefix "obj" r3 of
-    Just r  -> Right (dropWS r)
-    Nothing -> Left ("Expected 'obj' at offset " <> show off)
-  fst <$> parseValue after
 
 -- | Load an object stored inside an object stream.
 -- @stmObjNum@ is the object number of the ObjStm; @idx@ is the 0-based index
@@ -1191,208 +936,6 @@ buildTrailerSection size prevOff origTrailer =
        "trailer\n" <> serializeDict td <> "\n"
 
 -- ---------------------------------------------------------------------------
--- PDF value parser
---
--- All parsing is purely positional: each @parse*@ function takes a
--- 'ByteString' starting at the current position and returns the parsed value
--- together with the remaining input.
-
-type ParseResult a = Either String (a, ByteString)
-
-parseValue :: ByteString -> ParseResult PDFValue
-parseValue bs0 =
-  let bs = dropWS bs0
-  in if BS.null bs
-     then Left "Unexpected end of input"
-     else case BSC.head bs of
-       'n' | "null"  `BS.isPrefixOf` bs -> Right (PDFNull,        BS.drop 4 bs)
-       't' | "true"  `BS.isPrefixOf` bs -> Right (PDFBool True,   BS.drop 4 bs)
-       'f' | "false" `BS.isPrefixOf` bs -> Right (PDFBool False,  BS.drop 5 bs)
-       -- PDF names may be empty (e.g. the empty-selection state serialised as @\/@).
-       '/'  -> let (nm, rest) = BS.span isNameByte (BS.tail bs)
-               in Right (PDFName nm, rest)
-       '('  -> (\(s,  r) -> (PDFString s, r)) <$> parseLiteralString (BS.tail bs) 0
-       '<'  ->
-         if BS.length bs >= 2 && BSC.index bs 1 == '<'
-           then (\(d, r) -> (PDFDict d, r)) <$> parseDict bs
-           else (\(s, r) -> (PDFString s, r)) <$> parseHexString (BS.drop 1 bs)
-       '['  -> (\(a, r) -> (PDFArray a, r)) <$> parseArray (BS.drop 1 bs)
-       c | c == '-' || c == '+' || isDigit c -> parseNumOrRef bs
-       _    -> Left ("Unexpected character: " <> [BSC.head bs])
-
--- | Parse a PDF name token (without the leading '/').
--- Returns an error for empty names, which are invalid as dictionary keys.
-parseName :: ByteString -> ParseResult ByteString
-parseName bs =
-  let (nm, rest) = BS.span isNameByte bs
-  in if BS.null nm
-     then Left "Empty name"
-     else Right (nm, rest)
-
--- | Predicate for bytes that are valid inside a PDF name token.
-isNameByte :: Word8 -> Bool
-isNameByte w =
-  let c = chr (fromIntegral w)
-  in not (isSpace c) && c `notElem` ("/()<>[]{}%\0" :: String)
-
--- | Parse a PDF literal string (the opening '(' has already been consumed).
--- Depth tracks nesting: each '(' increments it and each ')' decrements it;
--- at depth zero a ')' ends the string.
-parseLiteralString :: ByteString -> Int -> ParseResult ByteString
-parseLiteralString bs0 depth0 = go bs0 depth0 mempty
-  where
-    go bs depth acc
-      | BS.null bs = Left "Unterminated literal string"
-      | otherwise  =
-          let (w, rest) = (BS.head bs, BS.tail bs)
-              c = chr (fromIntegral w)
-          in case c of
-               ')' | depth == 0 -> Right (acc, rest)
-               ')'  -> go rest (depth - 1) (BS.snoc acc w)
-               '('  -> go rest (depth + 1) (BS.snoc acc w)
-               '\\' -> do
-                 (esc, rest') <- parseLiteralEscape rest
-                 go rest' depth (acc <> esc)
-               _ -> go rest depth (BS.snoc acc w)
-
-parseLiteralEscape :: ByteString -> ParseResult ByteString
-parseLiteralEscape bs
-  | BS.null bs = Left "Unterminated escape in literal string"
-  | otherwise  =
-      let (w, rest) = (BS.head bs, BS.tail bs)
-          c = chr (fromIntegral w)
-      in case c of
-           'n'  -> Right ("\n", rest)
-           'r'  -> Right ("\r", rest)
-           't'  -> Right ("\t", rest)
-           'b'  -> Right ("\b", rest)
-           'f'  -> Right ("\f", rest)
-           '('  -> Right ("(",  rest)
-           ')'  -> Right (")",  rest)
-           '\\' -> Right ("\\", rest)
-           '\r' ->  -- line continuation
-             let rest' = case BSC.uncons rest of
-                           Just ('\n', r) -> r
-                           _              -> rest
-             in Right ("", rest')
-           '\n' -> Right ("", rest)  -- line continuation
-           d | d >= '0' && d <= '7' ->
-             -- Read 1–3 octal digits (first digit already in hand as w).
-             let (extra, _) = BS.span isOctByte (BS.take 2 rest)
-                 -- Combine the first digit with up to 2 more.
-                 allDigits  = BS.cons w extra
-                 val        = BS.foldl' (\acc b -> acc * 8 + fromIntegral b - 0x30) 0 allDigits
-             in Right (BS.singleton val, BS.drop (BS.length extra) rest)
-           _ -> Right (BS.singleton w, rest)
-  where
-    isOctByte b = b >= 0x30 && b <= 0x37
-
--- | Parse a PDF hex string (the opening '<' has already been consumed).
-parseHexString :: ByteString -> ParseResult ByteString
-parseHexString bs0 = go bs0 []
-  where
-    go bs acc =
-      let bs' = BSC.dropWhile isSpace bs
-      in case BSC.uncons bs' of
-           Nothing        -> Left "Unterminated hex string"
-           Just ('>', r)  -> Right (BS.pack (reverse acc), r)
-           Just (h1, r1) | isHexDigit h1 ->
-             let (h2c, r2) = case BSC.uncons (BSC.dropWhile isSpace r1) of
-                               Just (h, r) | isHexDigit h -> (h, r)
-                               _                           -> ('0', BSC.dropWhile isSpace r1)
-                 val = fromIntegral (hexDigit h1 * 16 + hexDigit h2c)
-             in go r2 (val : acc)
-           Just (c, _) -> Left ("Invalid hex digit: " <> [c])
-
-hexDigit :: Char -> Int
-hexDigit c
-  | c >= '0' && c <= '9' = ord c - ord '0'
-  | c >= 'a' && c <= 'f' = ord c - ord 'a' + 10
-  | c >= 'A' && c <= 'F' = ord c - ord 'A' + 10
-  | otherwise             = 0
-
--- | Parse a PDF array (the opening '[' has already been consumed).
-parseArray :: ByteString -> ParseResult [PDFValue]
-parseArray bs0 = go (dropWS bs0) []
-  where
-    go bs acc
-      | BS.null bs         = Left "Unterminated array"
-      | BSC.head bs == ']' = Right (reverse acc, BS.tail bs)
-      | otherwise          = do
-          (v, rest) <- parseValue bs
-          go (dropWS rest) (v : acc)
-
--- | Parse a PDF dictionary (@\<\< ... \>\>@).
-parseDict :: ByteString -> ParseResult (Map ByteString PDFValue)
-parseDict bs0 = do
-  rest0 <- case BS.stripPrefix "<<" bs0 of
-    Just r  -> Right r
-    Nothing -> Left ("Expected '<<', got: " <> BSC.unpack (BS.take 10 bs0))
-  go (dropWS rest0) Map.empty
-  where
-    go bs acc
-      | BS.null bs                      = Left "Unterminated dictionary"
-      | ">>" `BS.isPrefixOf` bs         = Right (acc, BS.drop 2 bs)
-      | BSC.head bs == '/'              = do
-          (nm, r1) <- parseName (BS.tail bs)
-          (v,  r2) <- parseValue (dropWS r1)
-          go (dropWS r2) (Map.insert nm v acc)
-      | otherwise                       =
-          Left ("Unexpected char in dictionary: " <> [BSC.head bs])
-
--- | Parse an integer, real, or indirect reference (e.g. @1 0 R@).
-parseNumOrRef :: ByteString -> ParseResult PDFValue
-parseNumOrRef bs0 = do
-  let (sign, bs1) = case BSC.uncons bs0 of
-                      Just ('-', r) -> ("-", r)
-                      Just ('+', r) -> ("",  r)
-                      _             -> ("",  bs0)
-      (digits, rest) = BSC.span isDigit bs1
-  when (BS.null digits) $ Left ("Expected number, got: " <> BSC.unpack (BS.take 10 bs0))
-  n <- readDecimal digits
-  let signedN = if sign == "-" then negate n else n
-      rest' = dropWS rest
-  case BSC.uncons rest' of
-    Just ('.', afterDot) ->
-      -- frac is the result of BSC.span isDigit, so it contains only digit
-      -- characters; BSC.readInt succeeds unless frac is empty (e.g. "3."),
-      -- in which case we treat the fractional part as zero.
-      let (frac, rest'') = BSC.span isDigit afterDot
-          fracN = maybe 0 fst (BSC.readInt frac)
-          dVal  = fromIntegral signedN + fromIntegral fracN / (10 ^ BS.length frac)
-      in parseOptionalExponent dVal rest''
-    Just (c, _) | isDigit c && sign == "" -> do
-      -- Could be "N G R" (indirect reference).
-      let (gen, rest'') = BSC.span isDigit rest'
-          rest''' = dropWS rest''
-      genN <- readDecimal gen
-      case BS.stripPrefix "R" rest''' of
-        Just r  -> Right (PDFRef n genN, dropWS r)
-        Nothing -> Right (PDFInt signedN, rest')
-    _ -> Right (PDFInt signedN, rest')
-
--- | If the bytestring starts with an @e@/@E@ exponent, consume it and
--- return the adjusted 'PDFReal'; otherwise return the value as-is.
--- This handles scientific notation that may appear in PDFs from other tools
--- (e.g. @1.5e10@, @3.0E-2@) and also in our own round-trip when the
--- underlying @Double@ is serialised via @show@.
-parseOptionalExponent :: Double -> ByteString -> ParseResult PDFValue
-parseOptionalExponent dVal bs =
-  case BSC.uncons bs of
-    Just (c, afterE) | c == 'e' || c == 'E' ->
-      let (expSign, afterSign) = case BSC.uncons afterE of
-                                   Just ('+', r) -> (1,    r)
-                                   Just ('-', r) -> (-1,   r)
-                                   _             -> (1,    afterE)
-          (expDigits, rest') = BSC.span isDigit afterSign
-      in if BS.null expDigits
-           then Right (PDFReal dVal, bs)  -- bare 'e' that is not an exponent; leave it
-           else case BSC.readInt expDigits of
-                  Just (e, _) -> Right (PDFReal (dVal * (10.0 ** fromIntegral (expSign * e))), rest')
-                  Nothing     -> Right (PDFReal dVal, bs)
-    _ -> Right (PDFReal dVal, bs)
-
--- ---------------------------------------------------------------------------
 -- Dictionary lookup helpers
 
 dictLookupRef :: ByteString -> Map ByteString PDFValue -> Either String (Int, Int)
@@ -1421,36 +964,3 @@ loadArray bs xref dec key d =
         _          -> Left ("/" <> BSC.unpack key <> " reference is not an array")
     Just _ -> Left ("/" <> BSC.unpack key <> " is not an array")
     Nothing -> Left ("/" <> BSC.unpack key <> " not found in dict")
-
--- ---------------------------------------------------------------------------
--- Whitespace / utility helpers
-
--- | Drop PDF whitespace (space, tab, CR, LF, FF, NUL) from the front.
-dropWS :: ByteString -> ByteString
-dropWS = BSC.dropWhile isPDFWS
-
--- | Drop exactly one space or nothing (used between xref header tokens).
-dropWS1 :: ByteString -> ByteString
-dropWS1 bs = case BSC.uncons bs of
-  Just (c, r) | isPDFWS c -> r
-  _                        -> bs
-
-isPDFWS :: Char -> Bool
-isPDFWS c = c `elem` (" \t\r\n\f\0" :: String)
-
--- | Drop a line ending (CR, LF, or CRLF) from the front.
-dropLineEnd :: ByteString -> ByteString
-dropLineEnd bs = case BSC.uncons bs of
-  Just (' ',  r) -> dropLineEnd r
-  Just ('\r', r) -> case BSC.uncons r of
-                      Just ('\n', r') -> r'
-                      _               -> r
-  Just ('\n', r) -> r
-  _              -> bs
-
--- | Read a non-negative decimal integer from a 'ByteString', failing with
--- an error if the input does not start with at least one digit.
-readDecimal :: ByteString -> Either String Int
-readDecimal bs = case BSC.readInt bs of
-  Just (n, _) -> Right n
-  Nothing     -> Left ("Expected decimal integer, got: " <> BSC.unpack (BS.take 10 bs))

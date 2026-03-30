@@ -13,7 +13,6 @@ module Text.FDF.PDF.Parse (
   hexDigit, dropLineEnd, dropWS, dropWS1, readDecimal
 ) where
 
-import Prelude hiding (takeWhile)
 import Control.Applicative ((<|>), many, optional)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -23,9 +22,11 @@ import Data.Int (Int64)
 import Data.List (intercalate)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
 import Data.Word (Word8)
 import Rank2 qualified
-import Text.Grampa (InputParsing (..), ParseFailure (..), FailureDescription (..))
+import Text.Grampa (InputParsing (string, anyToken), InputCharParsing (..),
+                    ParseFailure (..), FailureDescription (..))
 import Text.Grampa.PEG.Backtrack qualified as PEG
 
 import Text.FDF.PDF.Types
@@ -33,19 +34,24 @@ import Text.FDF.PDF.Types
 -- ---------------------------------------------------------------------------
 -- Parser type
 
--- | Backtracking PEG parser for PDF value fragments, operating directly on
--- raw 'ByteString' input (byte-level parsing, no UTF-8 interpretation).
-type PDFParser = PEG.Parser (Rank2.Only PDFValue) ByteString
+-- | Backtracking PEG parser for PDF value fragments.  The input stream is
+-- 'ByteStringUTF8', which provides a safe character interface (via
+-- 'takeCharsWhile' etc.) for the ASCII-structured PDF syntax.
+type PDFParser = PEG.Parser (Rank2.Only PDFValue) ByteStringUTF8
 
 -- | Run a 'PDFParser', returning the result and the remaining (unconsumed)
 -- input on success, or an error message on failure.
 runParser :: PDFParser a -> ByteString -> Either String (a, ByteString)
-runParser p input = case PEG.applyParser p input of
-  PEG.Parsed v rest -> Right (v, rest)
+runParser p input = case PEG.applyParser p (ByteStringUTF8 input) of
+  PEG.Parsed v (ByteStringUTF8 rest) -> Right (v, rest)
   PEG.NoParse (ParseFailure _ (FailureDescription descs lits) errs) ->
-    Left $ case descs ++ map BSC.unpack lits ++ errs of
+    Left $ case descs ++ map (BSC.unpack . unwrapBS) lits ++ errs of
       []   -> "Parse failure"
       msgs -> "Expected: " ++ intercalate ", " msgs
+
+-- | Unwrap 'ByteStringUTF8' to the underlying 'ByteString'.
+unwrapBS :: ByteStringUTF8 -> ByteString
+unwrapBS (ByteStringUTF8 bs) = bs
 
 -- ---------------------------------------------------------------------------
 -- Exported parsing entry points
@@ -74,31 +80,19 @@ parseDict :: ByteString -> ParseResult (Map ByteString PDFValue)
 parseDict bs = runParser pdfDict bs
 
 -- ---------------------------------------------------------------------------
--- Byte-level predicates (operating on single-byte 'ByteString' factors)
+-- Character predicates
 
--- | A single-byte factor is a PDF whitespace character.
-isPDFWSByte :: ByteString -> Bool
-isPDFWSByte b = case BSC.uncons b of
-  Just (c, _) -> isPDFWS c
-  Nothing     -> False
+-- | Is a character PDF whitespace?
+isPDFWS :: Char -> Bool
+isPDFWS c = c `elem` (" \t\r\n\f\0" :: String)
 
--- | A single-byte factor is valid inside a PDF name token.
-isNameByte' :: ByteString -> Bool
-isNameByte' b = case BSC.uncons b of
-  Just (c, _) -> not (isSpace c) && c `notElem` ("/()<>[]{}%\0" :: String)
-  Nothing     -> False
+-- | Is a character valid inside a PDF name token?
+isNameChar :: Char -> Bool
+isNameChar c = not (isSpace c) && c `notElem` ("/()<>[]{}%\0" :: String)
 
--- | A single-byte factor is an ASCII decimal digit.
-isDigitByte :: ByteString -> Bool
-isDigitByte b = case BSC.uncons b of
-  Just (c, _) -> isDigit c
-  Nothing     -> False
-
--- | A single-byte factor is an octal digit (@0@–@7@).
-isOctByte :: ByteString -> Bool
-isOctByte b = case BSC.uncons b of
-  Just (c, _) -> c >= '0' && c <= '7'
-  Nothing     -> False
+-- | Is a character an octal digit (@0@–@7@)?
+isOctChar :: Char -> Bool
+isOctChar c = c >= '0' && c <= '7'
 
 -- ---------------------------------------------------------------------------
 -- Core PDF value parser
@@ -110,7 +104,7 @@ pdfValue = skipWS *>
   <|> PDFBool True  <$  string "true"
   <|> PDFBool False <$  string "false"
   -- PDF names may be empty (e.g. empty-selection state serialised as @\/@).
-  <|> PDFName       <$> (string "/" *> takeWhile isNameByte')
+  <|> PDFName       <$> (string "/" *> (unwrapBS <$> takeCharsWhile isNameChar))
   <|> PDFString     <$> pdfLiteralString
   -- Try dict (<<) before hex string (<).
   <|> PDFDict       <$> pdfDict
@@ -119,9 +113,9 @@ pdfValue = skipWS *>
   <|> pdfNumOrRef
   )
 
--- | Skip zero or more PDF whitespace bytes.
-skipWS :: PDFParser ByteString
-skipWS = takeWhile isPDFWSByte
+-- | Skip zero or more PDF whitespace characters.
+skipWS :: PDFParser ByteStringUTF8
+skipWS = takeCharsWhile isPDFWS
 
 -- ---------------------------------------------------------------------------
 -- Literal string
@@ -138,17 +132,15 @@ pdfLiteralContent = fmap mconcat $ many litChunk
     litChunk =
           litEscape
       <|> litNested
-      <|> takeWhile1 isRegularLitByte
+      <|> (unwrapBS <$> takeCharsWhile1 isRegularLitChar)
     -- A nested pair @(...)@ is kept verbatim in the string value.
     litNested = do
       _ <- string "("
       inner <- pdfLiteralContent
       _ <- string ")"
       return ("(" <> inner <> ")")
-    -- Any byte other than @(@, @)@, or @\@ is a regular literal byte.
-    -- The predicate operates on single-byte 'ByteString' prime factors as
-    -- produced by 'takeWhile1' over 'ByteString' input.
-    isRegularLitByte b = b /= "(" && b /= ")" && b /= "\\"
+    -- Any character except @(@, @)@, or @\@ is a regular literal character.
+    isRegularLitChar c = c /= '(' && c /= ')' && c /= '\\'
 
 -- | Parse a backslash escape sequence inside a literal string.
 litEscape :: PDFParser ByteString
@@ -165,8 +157,8 @@ litEscape = string "\\" *>
   <|> ""    <$ (string "\r" *> optional (string "\n"))
   <|> ""    <$ string "\n"
   <|> pdfOctalEscape
-  -- Any other byte after backslash is kept as-is (PDF §7.3.4.2).
-  <|> anyToken
+  -- Any other character after backslash is kept as-is (PDF §7.3.4.2).
+  <|> unwrapBS <$> anyToken
   )
 
 -- | Parse 1–3 octal digits and return the corresponding byte value.
@@ -185,7 +177,8 @@ pdfOctalEscape = do
 
 -- | Parse a single octal digit, returning its numeric value.
 octDigitVal :: PDFParser Int
-octDigitVal = fmap (\b -> ord (BSC.head b) - 0x30) (satisfy isOctByte)
+octDigitVal = fmap (\(ByteStringUTF8 bs) -> ord (BSC.head bs) - 0x30)
+                   (satisfyCharInput isOctChar)
 
 -- ---------------------------------------------------------------------------
 -- Hex string
@@ -206,11 +199,8 @@ pdfHexBody = fmap BS.pack (many hexBytePair) <* skipWS <* string ">"
       -- (PDF §7.3.4.3).
       h2 <- hexNibble <|> pure 0
       return (fromIntegral (h1 * 16 + h2) :: Word8)
-    hexNibble =
-      fmap (\b -> hexDigit (BSC.head b))
-        (satisfy (\b -> case BSC.uncons b of
-                          Just (c, _) -> isHexDigit c
-                          Nothing     -> False))
+    hexNibble = fmap (\(ByteStringUTF8 bs) -> hexDigit (BSC.head bs))
+                     (satisfyCharInput isHexDigit)
 
 -- ---------------------------------------------------------------------------
 -- Array
@@ -233,7 +223,7 @@ pdfDictBody = fmap Map.fromList (many pdfEntry) <* skipWS <* string ">>"
     pdfEntry = do
       _ <- skipWS *> string "/"
       -- Dictionary keys must be non-empty names.
-      name  <- takeWhile1 isNameByte'
+      name  <- unwrapBS <$> takeCharsWhile1 isNameChar
       value <- pdfValue
       return (name, value)
 
@@ -242,7 +232,7 @@ pdfDictBody = fmap Map.fromList (many pdfEntry) <* skipWS <* string ">>"
 
 -- | Parse an unsigned decimal integer (one or more digits).
 pdfUnsignedInt :: PDFParser Int
-pdfUnsignedInt = fmap (maybe 0 fst . BSC.readInt) (takeWhile1 isDigitByte)
+pdfUnsignedInt = fmap (maybe 0 fst . BSC.readInt . unwrapBS) (takeCharsWhile1 isDigit)
 
 -- | Parse an indirect object reference (@N G R@), a real number, or an integer.
 pdfNumOrRef :: PDFParser PDFValue
@@ -263,7 +253,7 @@ pdfRef = do
 pdfNum :: PDFParser PDFValue
 pdfNum = do
   negative  <- (True <$ string "-") <|> (False <$ string "+") <|> pure False
-  intDigits <- takeWhile1 isDigitByte
+  intDigits <- unwrapBS <$> takeCharsWhile1 isDigit
   let n       = maybe 0 fst (BSC.readInt intDigits)
       signedN = if negative then negate n else n
   (PDFReal <$> pdfFloatTail (fromIntegral signedN))
@@ -273,7 +263,7 @@ pdfNum = do
 pdfFloatTail :: Double -> PDFParser Double
 pdfFloatTail intPart = do
   _ <- string "."
-  fracDigits <- takeWhile isDigitByte
+  fracDigits <- unwrapBS <$> takeCharsWhile isDigit
   let fracN = maybe 0 fst (BSC.readInt fracDigits)
       dVal  = intPart + fromIntegral fracN / (10.0 ^ BS.length fracDigits)
   pdfExpTail dVal
@@ -285,9 +275,9 @@ pdfFloatTail intPart = do
 -- unconsumed and the value is returned unchanged.
 pdfExpTail :: Double -> PDFParser Double
 pdfExpTail dVal =
-  ( do _ <- satisfy (\b -> b == "e" || b == "E")
+  ( do _ <- satisfyCharInput (\c -> c == 'e' || c == 'E')
        expSign <- ((-1) <$ string "-") <|> (1 <$ string "+") <|> pure 1
-       expDigits <- takeWhile1 isDigitByte
+       expDigits <- unwrapBS <$> takeCharsWhile1 isDigit
        let e = expSign * maybe 0 fst (BSC.readInt expDigits)
        return (dVal * 10.0 ** fromIntegral (e :: Int))
   ) <|> pure dVal
@@ -304,9 +294,6 @@ dropWS1 :: ByteString -> ByteString
 dropWS1 bs = case BSC.uncons bs of
   Just (c, r) | isPDFWS c -> r
   _                        -> bs
-
-isPDFWS :: Char -> Bool
-isPDFWS c = c `elem` (" \t\r\n\f\0" :: String)
 
 -- | Drop a line ending (CR, LF, or CRLF) from the front.
 dropLineEnd :: ByteString -> ByteString

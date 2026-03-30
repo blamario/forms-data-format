@@ -215,6 +215,20 @@ testFloatRectRoundTrip ref =
              assertM ref "FloatField value should be 'OK'" $
                content (body fdf2) == FieldValue "OK"
 
+-- | fillPDF should be idempotent: applying the same FDF twice produces the
+-- same byte output as applying it once.
+testFillIdempotent :: FailRef -> IO ()
+testFillIdempotent ref =
+  let fdf = makeFillFDF Field { name = "TextField1", content = FieldValue "World" }
+  in case fillPDF fdf simplePDF of
+       Left err     -> modifyIORef ref (("fillPDF (first): " <> err) :)
+       Right filled1 ->
+         case fillPDF fdf filled1 of
+           Left err      -> modifyIORef ref (("fillPDF (second): " <> err) :)
+           Right filled2 ->
+             assertM ref "fillPDF should be idempotent (same bytes on second call)" $
+               filled1 == filled2
+
 -- ---------------------------------------------------------------------------
 -- Main
 
@@ -228,6 +242,7 @@ main = do
   run "fill radio PDF (text field only)"     testFillRadio
   run "empty-name /V / survives round-trip"  testEmptyNameRoundTrip
   run "float /Rect coords survive round-trip" testFloatRectRoundTrip
+  run "fillPDF is idempotent"                testFillIdempotent
   failures <- readIORef failRef
   if null failures
     then do

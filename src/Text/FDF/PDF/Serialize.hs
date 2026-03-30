@@ -49,8 +49,10 @@ applyUpdate pathMap (Right (objs, maxN)) (path, newVal) =
       let pdfVal = case Map.lookup "V" d of
                      Just (PDFName _) -> PDFName (Text.encodeUtf8 newVal)
                      _                -> PDFString (encodePDFStringValue newVal)
-          newDict = Map.insert "V" pdfVal d
-      in Right ((ref, newDict) : objs, maxN)
+      in if Map.lookup "V" d == Just pdfVal
+           then Right (objs, maxN)  -- already at the desired value; skip (idempotency)
+           else let newDict = Map.insert "V" pdfVal d
+                in Right ((ref, newDict) : objs, maxN)
 
 -- ---------------------------------------------------------------------------
 -- Incremental update writer

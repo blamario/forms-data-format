@@ -146,6 +146,8 @@ pdfLiteralContent = fmap mconcat $ many litChunk
       _ <- string ")"
       return ("(" <> inner <> ")")
     -- Any byte other than @(@, @)@, or @\@ is a regular literal byte.
+    -- The predicate operates on single-byte 'ByteString' prime factors as
+    -- produced by 'takeWhile1' over 'ByteString' input.
     isRegularLitByte b = b /= "(" && b /= ")" && b /= "\\"
 
 -- | Parse a backslash escape sequence inside a literal string.

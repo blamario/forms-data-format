@@ -23,10 +23,13 @@ import Data.List (intercalate)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
+import Data.Scientific (Scientific, toRealFloat)
+import qualified Data.Scientific as Sci
 import Data.Word (Word8)
 import Rank2 qualified
 import Text.Grampa (InputParsing (string, anyToken), InputCharParsing (..),
                     ParseFailure (..), FailureDescription (..))
+import Text.Grampa.Combinators (concatMany, moptional, upto)
 import Text.Grampa.PEG.Backtrack qualified as PEG
 
 import Text.FDF.PDF.Types
@@ -122,28 +125,24 @@ skipWS = takeCharsWhile isPDFWS
 
 -- | Parse a PDF literal string, consuming the opening @(@ and closing @)@.
 pdfLiteralString :: PDFParser ByteString
-pdfLiteralString = string "(" *> pdfLiteralContent <* string ")"
+pdfLiteralString = string "(" *> (unwrapBS <$> pdfLiteralContent) <* string ")"
 
 -- | Parse the content of a literal string up to the matching closing @)@.
 -- Handles nested parentheses and escape sequences.
-pdfLiteralContent :: PDFParser ByteString
-pdfLiteralContent = fmap mconcat $ many litChunk
+pdfLiteralContent :: PDFParser ByteStringUTF8
+pdfLiteralContent = concatMany litChunk
   where
     litChunk =
           litEscape
       <|> litNested
-      <|> (unwrapBS <$> takeCharsWhile1 isRegularLitChar)
+      <|> takeCharsWhile1 isRegularLitChar
     -- A nested pair @(...)@ is kept verbatim in the string value.
-    litNested = do
-      _ <- string "("
-      inner <- pdfLiteralContent
-      _ <- string ")"
-      return ("(" <> inner <> ")")
+    litNested = string "(" <> pdfLiteralContent <> string ")"
     -- Any character except @(@, @)@, or @\@ is a regular literal character.
     isRegularLitChar c = c /= '(' && c /= ')' && c /= '\\'
 
 -- | Parse a backslash escape sequence inside a literal string.
-litEscape :: PDFParser ByteString
+litEscape :: PDFParser ByteStringUTF8
 litEscape = string "\\" *>
   (   "\n"  <$ string "n"
   <|> "\r"  <$ string "r"
@@ -156,24 +155,17 @@ litEscape = string "\\" *>
   -- Line continuation: \r\n or \r or \n → empty string
   <|> ""    <$ (string "\r" *> optional (string "\n"))
   <|> ""    <$ string "\n"
-  <|> pdfOctalEscape
+  <|> ByteStringUTF8 <$> pdfOctalEscape
   -- Any other character after backslash is kept as-is (PDF §7.3.4.2).
-  <|> unwrapBS <$> anyToken
+  <|> anyToken
   )
 
 -- | Parse 1–3 octal digits and return the corresponding byte value.
 pdfOctalEscape :: PDFParser ByteString
-pdfOctalEscape = do
-  d1 <- octDigitVal
-  d2 <- optional octDigitVal
-  d3 <- case d2 of
-          Nothing -> return Nothing
-          Just _  -> optional octDigitVal
-  let n :: Word8 = fromIntegral $ case (d2, d3) of
-        (Nothing, _)       -> d1
-        (Just b2, Nothing) -> d1 * 8 + b2
-        (Just b2, Just b3) -> (d1 * 8 + b2) * 8 + b3
-  return (BS.singleton n)
+pdfOctalEscape = evalOctal <$> octalParser
+  where
+    evalOctal = BS.singleton . fromIntegral . foldl (\acc d -> 8*acc + d) 0
+    octalParser = (:) <$> octDigitVal <*> upto 2 octDigitVal
 
 -- | Parse a single octal digit, returning its numeric value.
 octDigitVal :: PDFParser Int
@@ -185,20 +177,16 @@ octDigitVal = fmap (\(ByteStringUTF8 bs) -> ord (BSC.head bs) - 0x30)
 
 -- | Parse a PDF hex string, consuming the opening @<@ and closing @>@.
 pdfHexString :: PDFParser ByteString
-pdfHexString = string "<" *> pdfHexBody
+pdfHexString = string "<" *> pdfHexBody <* string ">"
 
--- | Parse the body and closing @>@ of a hex string.
+-- | Parse the body of a hex string (without delimiters).
 pdfHexBody :: PDFParser ByteString
-pdfHexBody = fmap BS.pack (many hexBytePair) <* skipWS <* string ">"
+pdfHexBody = BS.pack <$> many hexBytePair <* skipWS
   where
-    hexBytePair = do
-      _ <- skipWS
-      h1 <- hexNibble
-      _ <- skipWS
-      -- The second nibble is optional; a lone nibble is padded with 0
-      -- (PDF §7.3.4.3).
-      h2 <- hexNibble <|> pure 0
-      return (fromIntegral (h1 * 16 + h2) :: Word8)
+    hexBytePair = toHexByte
+                    <$> (skipWS *> hexNibble)
+                    <*> (skipWS *> (hexNibble <|> pure 0))
+    toHexByte h1 h2 = fromIntegral (h1*16 + h2) :: Word8
     hexNibble = fmap (\(ByteStringUTF8 bs) -> hexDigit (BSC.head bs))
                      (satisfyCharInput isHexDigit)
 
@@ -214,11 +202,11 @@ pdfArray = string "[" *> many pdfValue <* skipWS <* string "]"
 
 -- | Parse a PDF dictionary (@\<\< ... \>\>@).
 pdfDict :: PDFParser (Map ByteString PDFValue)
-pdfDict = string "<<" *> pdfDictBody
+pdfDict = string "<<" *> pdfDictBody <* string ">>"
 
--- | Parse the body and closing @>>@ of a dictionary.
+-- | Parse the body of a dictionary (without the closing @>>@).
 pdfDictBody :: PDFParser (Map ByteString PDFValue)
-pdfDictBody = fmap Map.fromList (many pdfEntry) <* skipWS <* string ">>"
+pdfDictBody = Map.fromList <$> many pdfEntry <* skipWS
   where
     pdfEntry = do
       _ <- skipWS *> string "/"
@@ -241,46 +229,44 @@ pdfNumOrRef = pdfRef <|> pdfNum
 -- | Try to parse an indirect object reference (@N G R@).
 -- Object and generation numbers must be unsigned (positive) integers.
 pdfRef :: PDFParser PDFValue
-pdfRef = do
-  n <- pdfUnsignedInt
-  _ <- skipWS
-  m <- pdfUnsignedInt
-  _ <- skipWS
-  _ <- string "R"
-  return (PDFRef n m)
+pdfRef = PDFRef <$> pdfUnsignedInt <* skipWS <*> pdfUnsignedInt <* skipWS <* string "R"
 
 -- | Parse a signed integer or real number (with optional scientific exponent).
 pdfNum :: PDFParser PDFValue
 pdfNum = do
-  negative  <- (True <$ string "-") <|> (False <$ string "+") <|> pure False
-  intDigits <- unwrapBS <$> takeCharsWhile1 isDigit
-  let n       = maybe 0 fst (BSC.readInt intDigits)
-      signedN = if negative then negate n else n
-  (PDFReal <$> pdfFloatTail (fromIntegral signedN))
-    <|> pure (PDFInt signedN)
+  signedDigits <- unwrapBS <$>
+    (moptional (satisfyCharInput (\c -> c == '-' || c == '+')) <> takeCharsWhile1 isDigit)
+  let n   = maybe 0 fst (BSC.readInt signedDigits)
+      neg = not (BS.null signedDigits) && BSC.head signedDigits == '-'
+  PDFReal . toRealFloat <$> pdfRealTail (abs n) neg
+    <|> pure (PDFInt n)
 
--- | Parse the fractional part (@.digits@) and optional exponent of a real.
-pdfFloatTail :: Double -> PDFParser Double
-pdfFloatTail intPart = do
+-- | Parse the fractional part (@.digits@) and optional exponent, returning a
+-- 'Scientific' value.  @absInt@ is the absolute value of the integer part;
+-- @neg@ is 'True' for a negative number.
+pdfRealTail :: Int -> Bool -> PDFParser Scientific
+pdfRealTail absInt neg = do
   _ <- string "."
   fracDigits <- unwrapBS <$> takeCharsWhile isDigit
-  let fracN = maybe 0 fst (BSC.readInt fracDigits)
-      dVal  = intPart + fromIntegral fracN / (10.0 ^ BS.length fracDigits)
-  pdfExpTail dVal
+  let fracLen = BS.length fracDigits
+      fracN   = maybe 0 fst (BSC.readInt fracDigits)
+      coeff   = toInteger absInt * 10 ^ fracLen + toInteger fracN
+  pdfExpTail (Sci.scientific (if neg then negate coeff else coeff) (negate fracLen))
 
--- | Consume an optional scientific-notation exponent (@e±N@ or @E±N@).
+-- | Consume an optional scientific-notation exponent (@e±N@ or @E±N@),
+-- returning an updated 'Scientific'.
 --
 -- If the @e@\/@E@ is not followed by at least one digit (e.g. a bare @e@
 -- that begins a subsequent keyword like @endobj@), the @e@\/@E@ is left
 -- unconsumed and the value is returned unchanged.
-pdfExpTail :: Double -> PDFParser Double
-pdfExpTail dVal =
+pdfExpTail :: Scientific -> PDFParser Scientific
+pdfExpTail sci =
   ( do _ <- satisfyCharInput (\c -> c == 'e' || c == 'E')
        expSign <- ((-1) <$ string "-") <|> (1 <$ string "+") <|> pure 1
        expDigits <- unwrapBS <$> takeCharsWhile1 isDigit
        let e = expSign * maybe 0 fst (BSC.readInt expDigits)
-       return (dVal * 10.0 ** fromIntegral (e :: Int))
-  ) <|> pure dVal
+       return (Sci.scientific (Sci.coefficient sci) (Sci.base10Exponent sci + e))
+  ) <|> pure sci
 
 -- ---------------------------------------------------------------------------
 -- Whitespace / utility helpers

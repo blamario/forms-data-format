@@ -1,7 +1,8 @@
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | Parsing of PDF XRefs
+-- | Parsing of PDF XRefs using 'Text.Grampa.PEG.Backtrack'.
 --
 -- References: PDF 32000-1:2008 (PDF 1.7 specification):
 --
@@ -9,19 +10,75 @@
 
 module Text.FDF.PDF.XRef (parseXRefChain) where
 
-import Control.Monad (when)
+import Control.Applicative ((<|>))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.Char (isDigit)
 import Data.Int (Int64)
+import Data.List (intercalate)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
+import Rank2 qualified
+import Text.Grampa (InputParsing (string), InputCharParsing (..),
+                    ParseFailure (..), FailureDescription (..))
+import Text.Grampa.PEG.Backtrack qualified as PEG
 
 import Text.FDF.PDF.Decompress (decompressStream)
-import Text.FDF.PDF.Parse (dropLineEnd, dropWS, dropWS1, parseDict, readDecimal)
+import Text.FDF.PDF.Parse (parseDict)
 import Text.FDF.PDF.Types
+
+-- ---------------------------------------------------------------------------
+-- Parser type
+
+-- | Backtracking PEG parser for XRef fragments.  The input stream is
+-- 'ByteStringUTF8', which provides a safe character interface (via
+-- 'takeCharsWhile' etc.) for the ASCII-structured PDF syntax.
+type XRefParser = PEG.Parser (Rank2.Only PDFValue) ByteStringUTF8
+
+-- | Run an 'XRefParser', returning the result and the remaining (unconsumed)
+-- input on success, or an error message on failure.
+runXRefParser :: XRefParser a -> ByteString -> Either String (a, ByteString)
+runXRefParser p input = case PEG.applyParser p (ByteStringUTF8 input) of
+  PEG.Parsed v (ByteStringUTF8 rest) -> Right (v, rest)
+  PEG.NoParse (ParseFailure _ (FailureDescription descs lits) errs) ->
+    Left $ case descs ++ map (BSC.unpack . unwrapBS) lits ++ errs of
+      []   -> "Parse failure"
+      msgs -> "Expected: " ++ intercalate ", " msgs
+
+-- | Unwrap 'ByteStringUTF8' to the underlying 'ByteString'.
+unwrapBS :: ByteStringUTF8 -> ByteString
+unwrapBS (ByteStringUTF8 bs) = bs
+
+-- ---------------------------------------------------------------------------
+-- Character predicates and primitive parsers
+
+-- | Is a character PDF whitespace?
+isPDFWS :: Char -> Bool
+isPDFWS c = c `elem` (" \t\r\n\f\0" :: String)
+
+-- | Skip zero or more PDF whitespace characters.
+pWS :: XRefParser ()
+pWS = () <$ takeCharsWhile isPDFWS
+
+-- | Skip one or more PDF whitespace characters.
+pWS1 :: XRefParser ()
+pWS1 = () <$ takeCharsWhile1 isPDFWS
+
+-- | Skip trailing spaces and then a line ending (CR, LF, or CRLF).
+-- Tolerates missing line endings: if none is present the parser still succeeds
+-- without consuming additional input.
+pLineEnd :: XRefParser ()
+pLineEnd =
+  () <$ takeCharsWhile (== ' ') <*
+  ((string "\r\n" <|> string "\r" <|> string "\n") <|> pure "")
+
+-- | Parse an unsigned decimal integer (one or more digits).
+pUnsignedInt :: XRefParser Int
+pUnsignedInt =
+  fmap (maybe 0 fst . BSC.readInt . unwrapBS) (takeCharsWhile1 isDigit)
 
 -- | Parse the full chain of cross-reference tables, following @/Prev@ and
 -- @/XRefStm@ links.
@@ -65,42 +122,45 @@ parseOneXRef bs off = do
 -- | Parse a traditional (table-based) cross-reference section and its trailer.
 parseTraditionalXRef :: ByteString -> Either String (XRef, Map ByteString PDFValue)
 parseTraditionalXRef raw = do
-  -- Skip "xref" + whitespace
-  let bs0 = dropWS (BS.drop 4 raw)
-  (bs1, xref) <- parseSubsections bs0 IntMap.empty
-  -- bs1 should now start with "trailer"
-  let afterTrailer = dropWS (BS.drop 7 bs1)  -- skip "trailer"
+  -- Skip "xref" keyword and following whitespace.
+  ((), afterXRef) <- runXRefParser (string "xref" *> pWS) raw
+  (afterSubs, xref) <- parseSubsections afterXRef IntMap.empty
+  -- Skip "trailer" keyword and following whitespace.
+  ((), afterTrailer) <- runXRefParser (string "trailer" *> pWS) afterSubs
   case parseDict afterTrailer of
     Left err       -> Left ("Trailer dict parse error: " <> err)
     Right (td, _)  -> Right (xref, td)
 
 -- | Parse zero or more xref subsections, stopping at "trailer".
 parseSubsections :: ByteString -> XRef -> Either String (ByteString, XRef)
-parseSubsections bs xref =
+parseSubsections bs xref = do
   -- Drop any whitespace between subsections (or before "trailer").
-  let bs' = dropWS bs
-  in if "trailer" `BS.isPrefixOf` bs'
-       then Right (bs', xref)
-       else do
-         (bs'', entries) <- parseSubsection bs'
-         parseSubsections bs'' (IntMap.union entries xref)
+  ((), bs') <- runXRefParser pWS bs
+  if "trailer" `BS.isPrefixOf` bs'
+    then Right (bs', xref)
+    else do
+      (bs'', entries) <- parseSubsection bs'
+      parseSubsections bs'' (IntMap.union entries xref)
 
 -- | Parse one xref subsection: @firstObj count\n@ followed by entries.
 parseSubsection :: ByteString -> Either String (ByteString, XRef)
 parseSubsection bs0 = do
-  let (firstStr, r1) = BSC.span isDigit bs0
-  when (BS.null firstStr) $ Left "Expected object number in xref subsection"
-  firstObj <- readDecimal firstStr
-  let (countStr, r2) = BSC.span isDigit (dropWS1 r1)
-  when (BS.null countStr) $ Left "Expected count in xref subsection"
-  count <- readDecimal countStr
-  let r3      = dropLineEnd r2
-      entries = IntMap.fromList
+  ((firstObj, count), r) <- runXRefParser pSubsectionHeader bs0
+  let entries = IntMap.fromList
                   [ (firstObj + i, e)
                   | i <- [0 .. count - 1]
-                  , Just e <- [parseXRefEntry (BS.take 20 (BS.drop (i * 20) r3))]
+                  , Just e <- [parseXRefEntry (BS.take 20 (BS.drop (i * 20) r))]
                   ]
-  Right (BS.drop (count * 20) r3, entries)
+  Right (BS.drop (count * 20) r, entries)
+
+-- | Parser for the @firstObj count@ header line of an xref subsection.
+pSubsectionHeader :: XRefParser (Int, Int)
+pSubsectionHeader = do
+  firstObj <- pUnsignedInt
+  pWS1
+  count    <- pUnsignedInt
+  pLineEnd
+  return (firstObj, count)
 
 -- | Parse one 20-byte xref entry.  Returns 'Nothing' for free entries.
 parseXRefEntry :: ByteString -> Maybe XRefEntry
@@ -117,34 +177,41 @@ parseXRefEntry entry
 -- Returns the stream dictionary and the raw (possibly compressed) stream bytes.
 parseStreamAt :: ByteString -> Int64 -> Either String (Map ByteString PDFValue, ByteString)
 parseStreamAt bs off = do
-  let chunk = dropWS (BS.drop (fromIntegral off) bs)
-  -- Skip "N G obj"
-  let (_, r1) = BSC.span isDigit chunk
-      (_, r2) = BSC.span isDigit (dropWS r1)
-      r3      = dropWS r2
-  after <- case BSC.stripPrefix "obj" r3 of
-    Just r  -> Right (dropWS r)
-    Nothing -> Left ("Expected 'obj' at offset " <> show off)
-  (dict, rest) <- parseDict after
-  -- The next token should be "stream".
-  let rest' = dropWS rest
-  case BS.stripPrefix "stream" rest' of
-    Nothing       -> Left ("Expected 'stream' keyword at offset " <> show off)
-    Just afterKW  -> do
-      -- Skip exactly one EOL (CR, LF, or CRLF) after the keyword.
-      let streamStart = case BSC.uncons afterKW of
-            Just ('\r', r) -> case BSC.uncons r of
-                                Just ('\n', r') -> r'
-                                _               -> r
-            Just ('\n', r) -> r
-            _              -> afterKW
-      -- /Length must be a direct integer in xref streams; may be indirect
-      -- in object streams (resolved after xref is built, see loadFromObjStream).
-      len <- case Map.lookup "Length" dict of
-               Just (PDFInt n) -> Right n
-               Just _          -> Left "Stream /Length is not a direct integer"
-               Nothing         -> Left "Stream dict missing /Length"
-      Right (dict, BS.take len streamStart)
+  let chunk = BS.drop (fromIntegral off) bs
+  -- Use PEG to skip "N G obj" and surrounding whitespace.
+  ((), afterObj) <- runXRefParser pObjHeader chunk
+  -- Parse the stream dictionary.
+  (dict, rest) <- parseDict afterObj
+  -- Use PEG to skip "stream" keyword and its mandatory EOL.
+  ((), streamStart) <- runXRefParser pStreamKeyword rest
+  -- /Length must be a direct integer in xref streams; may be indirect
+  -- in object streams (resolved after xref is built, see loadFromObjStream).
+  len <- case Map.lookup "Length" dict of
+           Just (PDFInt n) -> Right n
+           Just _          -> Left "Stream /Length is not a direct integer"
+           Nothing         -> Left "Stream dict missing /Length"
+  Right (dict, BS.take len streamStart)
+
+-- | Parser that skips leading whitespace and the @N G obj@ header,
+-- leaving the cursor just before the stream dictionary.
+-- The object and generation numbers are parsed solely to advance past them;
+-- they are not needed for stream extraction.
+pObjHeader :: XRefParser ()
+pObjHeader = do
+  pWS
+  _ <- takeCharsWhile1 isDigit   -- object number (advance past only)
+  pWS1
+  _ <- takeCharsWhile1 isDigit   -- generation number (advance past only)
+  pWS1
+  _ <- string "obj"
+  pWS
+
+-- | Parser that consumes the @stream@ keyword and exactly one EOL.
+pStreamKeyword :: XRefParser ()
+pStreamKeyword = do
+  pWS
+  _ <- string "stream"
+  pLineEnd
 
 -- ---------------------------------------------------------------------------
 -- Cross-reference stream (PDF 1.5+)

@@ -1,7 +1,8 @@
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | Parsing of PDF values
+-- | Parsing of PDF values using 'Text.Grampa.PEG.Backtrack'.
 --
 -- References: PDF 32000-1:2008 (PDF 1.7 specification):
 --
@@ -12,18 +13,53 @@ module Text.FDF.PDF.Parse (
   hexDigit, dropLineEnd, dropWS, dropWS1, readDecimal
 ) where
 
-import Control.Monad (when)
+import Control.Applicative ((<|>), empty, many, optional)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
-import Data.Char (chr, isDigit, isHexDigit, isSpace, ord)
+import Data.Char (isDigit, isHexDigit, isSpace, ord)
 import Data.Int (Int64)
+import Data.List (intercalate)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
+import Data.Scientific (Scientific, toRealFloat)
 import Data.Word (Word8)
+import Rank2 qualified
+import Text.Grampa (InputParsing (string, anyToken), InputCharParsing (..),
+                    ParseFailure (..), FailureDescription (..))
+import Text.Grampa.Combinators (concatMany, moptional, upto)
+import Text.Grampa.PEG.Backtrack qualified as PEG
+import Text.Read (readMaybe)
 
 import Text.FDF.PDF.Types
 
+-- ---------------------------------------------------------------------------
+-- Parser type
+
+-- | Backtracking PEG parser for PDF value fragments.  The input stream is
+-- 'ByteStringUTF8', which provides a safe character interface (via
+-- 'takeCharsWhile' etc.) for the ASCII-structured PDF syntax.
+type PDFParser = PEG.Parser (Rank2.Only PDFValue) ByteStringUTF8
+
+-- | Run a 'PDFParser', returning the result and the remaining (unconsumed)
+-- input on success, or an error message on failure.
+runParser :: PDFParser a -> ByteString -> Either String (a, ByteString)
+runParser p input = case PEG.applyParser p (ByteStringUTF8 input) of
+  PEG.Parsed v (ByteStringUTF8 rest) -> Right (v, rest)
+  PEG.NoParse (ParseFailure _ (FailureDescription descs lits) errs) ->
+    Left $ case descs ++ map (BSC.unpack . unwrapBS) lits ++ errs of
+      []   -> "Parse failure"
+      msgs -> "Expected: " ++ intercalate ", " msgs
+
+-- | Unwrap 'ByteStringUTF8' to the underlying 'ByteString'.
+unwrapBS :: ByteStringUTF8 -> ByteString
+unwrapBS (ByteStringUTF8 bs) = bs
+
+-- ---------------------------------------------------------------------------
+-- Exported parsing entry points
+
+type ParseResult a = Either String (a, ByteString)
 
 -- | Parse the indirect object (@N G obj ... endobj@) at the given offset.
 parseIndirectObject :: ByteString -> Int64 -> Either String PDFValue
@@ -38,207 +74,182 @@ parseIndirectObject bs off = do
     Nothing -> Left ("Expected 'obj' at offset " <> show off)
   fst <$> parseValue after
 
--- ---------------------------------------------------------------------------
--- PDF value parser
---
--- All parsing is purely positional: each @parse*@ function takes a
--- 'ByteString' starting at the current position and returns the parsed value
--- together with the remaining input.
-
-type ParseResult a = Either String (a, ByteString)
-
+-- | Parse any PDF value, skipping leading whitespace.
 parseValue :: ByteString -> ParseResult PDFValue
-parseValue bs0 =
-  let bs = dropWS bs0
-  in if BS.null bs
-     then Left "Unexpected end of input"
-     else case BSC.head bs of
-       'n' | "null"  `BS.isPrefixOf` bs -> Right (PDFNull,        BS.drop 4 bs)
-       't' | "true"  `BS.isPrefixOf` bs -> Right (PDFBool True,   BS.drop 4 bs)
-       'f' | "false" `BS.isPrefixOf` bs -> Right (PDFBool False,  BS.drop 5 bs)
-       -- PDF names may be empty (e.g. the empty-selection state serialised as @\/@).
-       '/'  -> let (nm, rest) = BS.span isNameByte (BS.tail bs)
-               in Right (PDFName nm, rest)
-       '('  -> (\(s,  r) -> (PDFString s, r)) <$> parseLiteralString (BS.tail bs) 0
-       '<'  ->
-         if BS.length bs >= 2 && BSC.index bs 1 == '<'
-           then (\(d, r) -> (PDFDict d, r)) <$> parseDict bs
-           else (\(s, r) -> (PDFString s, r)) <$> parseHexString (BS.drop 1 bs)
-       '['  -> (\(a, r) -> (PDFArray a, r)) <$> parseArray (BS.drop 1 bs)
-       c | c == '-' || c == '+' || isDigit c -> parseNumOrRef bs
-       _    -> Left ("Unexpected character: " <> [BSC.head bs])
+parseValue bs = runParser pdfValue bs
 
--- | Parse a PDF name token (without the leading '/').
--- Returns an error for empty names, which are invalid as dictionary keys.
-parseName :: ByteString -> ParseResult ByteString
-parseName bs =
-  let (nm, rest) = BS.span isNameByte bs
-  in if BS.null nm
-     then Left "Empty name"
-     else Right (nm, rest)
+-- | Parse a PDF dictionary (@\<\< ... \>\>@), skipping leading whitespace.
+parseDict :: ByteString -> ParseResult (Map ByteString PDFValue)
+parseDict bs = runParser pdfDict bs
 
--- | Predicate for bytes that are valid inside a PDF name token.
-isNameByte :: Word8 -> Bool
-isNameByte w =
-  let c = chr (fromIntegral w)
-  in not (isSpace c) && c `notElem` ("/()<>[]{}%\0" :: String)
+-- ---------------------------------------------------------------------------
+-- Character predicates
 
--- | Parse a PDF literal string (the opening '(' has already been consumed).
--- Depth tracks nesting: each '(' increments it and each ')' decrements it;
--- at depth zero a ')' ends the string.
-parseLiteralString :: ByteString -> Int -> ParseResult ByteString
-parseLiteralString bs0 depth0 = go bs0 depth0 mempty
+-- | Is a character PDF whitespace?
+isPDFWS :: Char -> Bool
+isPDFWS c = c `elem` (" \t\r\n\f\0" :: String)
+
+-- | Is a character valid inside a PDF name token?
+isNameChar :: Char -> Bool
+isNameChar c = not (isSpace c) && c `notElem` ("/()<>[]{}%\0" :: String)
+
+-- | Is a character an octal digit (@0@–@7@)?
+isOctChar :: Char -> Bool
+isOctChar c = c >= '0' && c <= '7'
+
+-- ---------------------------------------------------------------------------
+-- Core PDF value parser
+
+-- | Parser for any PDF value; skips leading whitespace.
+pdfValue :: PDFParser PDFValue
+pdfValue = skipWS *>
+  (   PDFNull       <$  string "null"
+  <|> PDFBool True  <$  string "true"
+  <|> PDFBool False <$  string "false"
+  -- PDF names may be empty (e.g. empty-selection state serialised as @\/@).
+  <|> PDFName       <$> (string "/" *> (unwrapBS <$> takeCharsWhile isNameChar))
+  <|> PDFString     <$> pdfLiteralString
+  -- Try dict (<<) before hex string (<).
+  <|> PDFDict       <$> pdfDict
+  <|> PDFString     <$> pdfHexString
+  <|> PDFArray      <$> pdfArray
+  <|> pdfNumOrRef
+  )
+
+-- | Skip zero or more PDF whitespace characters.
+skipWS :: PDFParser ByteStringUTF8
+skipWS = takeCharsWhile isPDFWS
+
+-- ---------------------------------------------------------------------------
+-- Literal string
+
+-- | Parse a PDF literal string, consuming the opening @(@ and closing @)@.
+pdfLiteralString :: PDFParser ByteString
+pdfLiteralString = string "(" *> (unwrapBS <$> pdfLiteralContent) <* string ")"
+
+-- | Parse the content of a literal string up to the matching closing @)@.
+-- Handles nested parentheses and escape sequences.
+pdfLiteralContent :: PDFParser ByteStringUTF8
+pdfLiteralContent = concatMany litChunk
   where
-    go bs depth acc
-      | BS.null bs = Left "Unterminated literal string"
-      | otherwise  =
-          let (w, rest) = (BS.head bs, BS.tail bs)
-              c = chr (fromIntegral w)
-          in case c of
-               ')' | depth == 0 -> Right (acc, rest)
-               ')'  -> go rest (depth - 1) (BS.snoc acc w)
-               '('  -> go rest (depth + 1) (BS.snoc acc w)
-               '\\' -> do
-                 (esc, rest') <- parseLiteralEscape rest
-                 go rest' depth (acc <> esc)
-               _ -> go rest depth (BS.snoc acc w)
+    litChunk =
+          litEscape
+      <|> litNested
+      <|> takeCharsWhile1 isRegularLitChar
+    -- A nested pair @(...)@ is kept verbatim in the string value.
+    litNested = string "(" <> pdfLiteralContent <> string ")"
+    -- Any character except @(@, @)@, or @\@ is a regular literal character.
+    isRegularLitChar c = c /= '(' && c /= ')' && c /= '\\'
 
-parseLiteralEscape :: ByteString -> ParseResult ByteString
-parseLiteralEscape bs
-  | BS.null bs = Left "Unterminated escape in literal string"
-  | otherwise  =
-      let (w, rest) = (BS.head bs, BS.tail bs)
-          c = chr (fromIntegral w)
-      in case c of
-           'n'  -> Right ("\n", rest)
-           'r'  -> Right ("\r", rest)
-           't'  -> Right ("\t", rest)
-           'b'  -> Right ("\b", rest)
-           'f'  -> Right ("\f", rest)
-           '('  -> Right ("(",  rest)
-           ')'  -> Right (")",  rest)
-           '\\' -> Right ("\\", rest)
-           '\r' ->  -- line continuation
-             let rest' = case BSC.uncons rest of
-                           Just ('\n', r) -> r
-                           _              -> rest
-             in Right ("", rest')
-           '\n' -> Right ("", rest)  -- line continuation
-           d | d >= '0' && d <= '7' ->
-             -- Read 1–3 octal digits (first digit already in hand as w).
-             let (extra, _) = BS.span isOctByte (BS.take 2 rest)
-                 -- Combine the first digit with up to 2 more.
-                 allDigits  = BS.cons w extra
-                 val        = BS.foldl' (\acc b -> acc * 8 + fromIntegral b - 0x30) 0 allDigits
-             in Right (BS.singleton val, BS.drop (BS.length extra) rest)
-           _ -> Right (BS.singleton w, rest)
+-- | Parse a backslash escape sequence inside a literal string.
+litEscape :: PDFParser ByteStringUTF8
+litEscape = string "\\" *>
+  (   "\n"  <$ string "n"
+  <|> "\r"  <$ string "r"
+  <|> "\t"  <$ string "t"
+  <|> "\b"  <$ string "b"
+  <|> "\f"  <$ string "f"
+  <|> "("   <$ string "("
+  <|> ")"   <$ string ")"
+  <|> "\\"  <$ string "\\"
+  -- Line continuation: \r\n or \r or \n → empty string
+  <|> ""    <$ (string "\r" *> optional (string "\n"))
+  <|> ""    <$ string "\n"
+  <|> ByteStringUTF8 <$> pdfOctalEscape
+  -- Any other character after backslash is kept as-is (PDF §7.3.4.2).
+  <|> anyToken
+  )
+
+-- | Parse 1–3 octal digits and return the corresponding byte value.
+pdfOctalEscape :: PDFParser ByteString
+pdfOctalEscape = evalOctal <$> octalParser
   where
-    isOctByte b = b >= 0x30 && b <= 0x37
+    evalOctal = BS.singleton . fromIntegral . foldl' (\acc d -> 8*acc + d) 0
+    octalParser = (:) <$> octDigitVal <*> upto 2 octDigitVal
 
--- | Parse a PDF hex string (the opening '<' has already been consumed).
-parseHexString :: ByteString -> ParseResult ByteString
-parseHexString bs0 = go bs0 []
+-- | Parse a single octal digit, returning its numeric value.
+octDigitVal :: PDFParser Int
+octDigitVal = fmap (\(ByteStringUTF8 bs) -> ord (BSC.head bs) - 0x30)
+                   (satisfyCharInput isOctChar)
+
+-- ---------------------------------------------------------------------------
+-- Hex string
+
+-- | Parse a PDF hex string, consuming the opening @<@ and closing @>@.
+pdfHexString :: PDFParser ByteString
+pdfHexString = string "<" *> pdfHexBody <* string ">"
+
+-- | Parse the body of a hex string (without delimiters).
+pdfHexBody :: PDFParser ByteString
+pdfHexBody = BS.pack <$> many hexBytePair <* skipWS
   where
-    go bs acc =
-      let bs' = BSC.dropWhile isSpace bs
-      in case BSC.uncons bs' of
-           Nothing        -> Left "Unterminated hex string"
-           Just ('>', r)  -> Right (BS.pack (reverse acc), r)
-           Just (h1, r1) | isHexDigit h1 ->
-             let (h2c, r2) = case BSC.uncons (BSC.dropWhile isSpace r1) of
-                               Just (h, r) | isHexDigit h -> (h, r)
-                               _                           -> ('0', BSC.dropWhile isSpace r1)
-                 val = fromIntegral (hexDigit h1 * 16 + hexDigit h2c)
-             in go r2 (val : acc)
-           Just (c, _) -> Left ("Invalid hex digit: " <> [c])
+    hexBytePair = toHexByte
+                    <$> (skipWS *> hexNibble)
+                    <*> (skipWS *> (hexNibble <|> pure 0))
+    toHexByte h1 h2 = fromIntegral (h1*16 + h2) :: Word8
+    hexNibble = fmap (\(ByteStringUTF8 bs) -> hexDigit (BSC.head bs))
+                     (satisfyCharInput isHexDigit)
 
-hexDigit :: Char -> Int
-hexDigit c
-  | c >= '0' && c <= '9' = ord c - ord '0'
-  | c >= 'a' && c <= 'f' = ord c - ord 'a' + 10
-  | c >= 'A' && c <= 'F' = ord c - ord 'A' + 10
-  | otherwise             = 0
+-- ---------------------------------------------------------------------------
+-- Array
 
--- | Parse a PDF array (the opening '[' has already been consumed).
-parseArray :: ByteString -> ParseResult [PDFValue]
-parseArray bs0 = go (dropWS bs0) []
-  where
-    go bs acc
-      | BS.null bs         = Left "Unterminated array"
-      | BSC.head bs == ']' = Right (reverse acc, BS.tail bs)
-      | otherwise          = do
-          (v, rest) <- parseValue bs
-          go (dropWS rest) (v : acc)
+-- | Parse a PDF array, consuming the opening @[@ and closing @]@.
+pdfArray :: PDFParser [PDFValue]
+pdfArray = string "[" *> many pdfValue <* skipWS <* string "]"
+
+-- ---------------------------------------------------------------------------
+-- Dictionary
 
 -- | Parse a PDF dictionary (@\<\< ... \>\>@).
-parseDict :: ByteString -> ParseResult (Map ByteString PDFValue)
-parseDict bs0 = do
-  rest0 <- case BS.stripPrefix "<<" bs0 of
-    Just r  -> Right r
-    Nothing -> Left ("Expected '<<', got: " <> BSC.unpack (BS.take 10 bs0))
-  go (dropWS rest0) Map.empty
+pdfDict :: PDFParser (Map ByteString PDFValue)
+pdfDict = string "<<" *> pdfDictBody <* string ">>"
+
+-- | Parse the body of a dictionary (without the closing @>>@).
+pdfDictBody :: PDFParser (Map ByteString PDFValue)
+pdfDictBody = Map.fromList <$> many pdfEntry <* skipWS
   where
-    go bs acc
-      | BS.null bs                      = Left "Unterminated dictionary"
-      | ">>" `BS.isPrefixOf` bs         = Right (acc, BS.drop 2 bs)
-      | BSC.head bs == '/'              = do
-          (nm, r1) <- parseName (BS.tail bs)
-          (v,  r2) <- parseValue (dropWS r1)
-          go (dropWS r2) (Map.insert nm v acc)
-      | otherwise                       =
-          Left ("Unexpected char in dictionary: " <> [BSC.head bs])
+    pdfEntry = do
+      _ <- skipWS *> string "/"
+      -- Dictionary keys must be non-empty names.
+      name  <- unwrapBS <$> takeCharsWhile1 isNameChar
+      value <- pdfValue
+      return (name, value)
 
--- | Parse an integer, real, or indirect reference (e.g. @1 0 R@).
-parseNumOrRef :: ByteString -> ParseResult PDFValue
-parseNumOrRef bs0 = do
-  let (sign, bs1) = case BSC.uncons bs0 of
-                      Just ('-', r) -> ("-", r)
-                      Just ('+', r) -> ("",  r)
-                      _             -> ("",  bs0)
-      (digits, rest) = BSC.span isDigit bs1
-  when (BS.null digits) $ Left ("Expected number, got: " <> BSC.unpack (BS.take 10 bs0))
-  n <- readDecimal digits
-  let signedN = if sign == "-" then negate n else n
-      rest' = dropWS rest
-  case BSC.uncons rest' of
-    Just ('.', afterDot) ->
-      -- frac is the result of BSC.span isDigit, so it contains only digit
-      -- characters; BSC.readInt succeeds unless frac is empty (e.g. "3."),
-      -- in which case we treat the fractional part as zero.
-      let (frac, rest'') = BSC.span isDigit afterDot
-          fracN = maybe 0 fst (BSC.readInt frac)
-          dVal  = fromIntegral signedN + fromIntegral fracN / (10 ^ BS.length frac)
-      in parseOptionalExponent dVal rest''
-    Just (c, _) | isDigit c && sign == "" -> do
-      -- Could be "N G R" (indirect reference).
-      let (gen, rest'') = BSC.span isDigit rest'
-          rest''' = dropWS rest''
-      genN <- readDecimal gen
-      case BS.stripPrefix "R" rest''' of
-        Just r  -> Right (PDFRef n genN, dropWS r)
-        Nothing -> Right (PDFInt signedN, rest')
-    _ -> Right (PDFInt signedN, rest')
+-- ---------------------------------------------------------------------------
+-- Numbers and indirect references
 
--- | If the bytestring starts with an @e@/@E@ exponent, consume it and
--- return the adjusted 'PDFReal'; otherwise return the value as-is.
--- This handles scientific notation that may appear in PDFs from other tools
--- (e.g. @1.5e10@, @3.0E-2@) and also in our own round-trip when the
--- underlying @Double@ is serialised via @show@.
-parseOptionalExponent :: Double -> ByteString -> ParseResult PDFValue
-parseOptionalExponent dVal bs =
-  case BSC.uncons bs of
-    Just (c, afterE) | c == 'e' || c == 'E' ->
-      let (expSign, afterSign) = case BSC.uncons afterE of
-                                   Just ('+', r) -> (1,    r)
-                                   Just ('-', r) -> (-1,   r)
-                                   _             -> (1,    afterE)
-          (expDigits, rest') = BSC.span isDigit afterSign
-      in if BS.null expDigits
-           then Right (PDFReal dVal, bs)  -- bare 'e' that is not an exponent; leave it
-           else case BSC.readInt expDigits of
-                  Just (e, _) -> Right (PDFReal (dVal * (10.0 ** fromIntegral (expSign * e))), rest')
-                  Nothing     -> Right (PDFReal dVal, bs)
-    _ -> Right (PDFReal dVal, bs)
+-- | Parse an unsigned decimal integer (one or more digits).
+pdfUnsignedInt :: PDFParser Int
+pdfUnsignedInt = fmap (maybe 0 fst . BSC.readInt . unwrapBS) (takeCharsWhile1 isDigit)
+
+-- | Parse an indirect object reference (@N G R@), a real number, or an integer.
+pdfNumOrRef :: PDFParser PDFValue
+pdfNumOrRef = pdfRef <|> pdfNum
+
+-- | Try to parse an indirect object reference (@N G R@).
+-- Object and generation numbers must be unsigned (positive) integers.
+pdfRef :: PDFParser PDFValue
+pdfRef = PDFRef <$> pdfUnsignedInt <* skipWS <*> pdfUnsignedInt <* skipWS <* string "R"
+
+-- | Parse a signed integer or real number (with optional scientific exponent).
+-- Collects the raw number text and delegates to 'readMaybe' for interpretation.
+pdfNum :: PDFParser PDFValue
+pdfNum = do
+  numStr <- BSC.unpack . unwrapBS <$>
+    (  moptional (satisfyCharInput (\c -> c == '-' || c == '+'))
+    <> takeCharsWhile1 isDigit
+    <> moptional (string "." <> takeCharsWhile isDigit)
+    <> moptional (  satisfyCharInput (\c -> c == 'e' || c == 'E')
+                 <> moptional (satisfyCharInput (\c -> c == '+' || c == '-'))
+                 <> takeCharsWhile1 isDigit)
+    )
+  if any (\c -> c == '.' || c == 'e' || c == 'E') numStr
+    then case readMaybe numStr of
+           Just s  -> pure (PDFReal (toRealFloat (s :: Scientific)))
+           Nothing -> empty
+    else case BSC.readInt (BSC.pack numStr) of
+           Just (n, _) -> pure (PDFInt n)
+           Nothing     -> empty
 
 -- ---------------------------------------------------------------------------
 -- Whitespace / utility helpers
@@ -247,14 +258,11 @@ parseOptionalExponent dVal bs =
 dropWS :: ByteString -> ByteString
 dropWS = BSC.dropWhile isPDFWS
 
--- | Drop exactly one space or nothing (used between xref header tokens).
+-- | Drop exactly one PDF whitespace character, or nothing.
 dropWS1 :: ByteString -> ByteString
 dropWS1 bs = case BSC.uncons bs of
   Just (c, r) | isPDFWS c -> r
   _                        -> bs
-
-isPDFWS :: Char -> Bool
-isPDFWS c = c `elem` (" \t\r\n\f\0" :: String)
 
 -- | Drop a line ending (CR, LF, or CRLF) from the front.
 dropLineEnd :: ByteString -> ByteString
@@ -272,3 +280,11 @@ readDecimal :: ByteString -> Either String Int
 readDecimal bs = case BSC.readInt bs of
   Just (n, _) -> Right n
   Nothing     -> Left ("Expected decimal integer, got: " <> BSC.unpack (BS.take 10 bs))
+
+-- | Convert a hex digit character to its integer value (0–15).
+hexDigit :: Char -> Int
+hexDigit c
+  | c >= '0' && c <= '9' = ord c - ord '0'
+  | c >= 'a' && c <= 'f' = ord c - ord 'a' + 10
+  | c >= 'A' && c <= 'F' = ord c - ord 'A' + 10
+  | otherwise             = 0

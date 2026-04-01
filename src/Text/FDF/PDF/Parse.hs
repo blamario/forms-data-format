@@ -13,7 +13,7 @@ module Text.FDF.PDF.Parse (
   hexDigit, dropLineEnd, dropWS, dropWS1, readDecimal
 ) where
 
-import Control.Applicative ((<|>), many, optional)
+import Control.Applicative ((<|>), empty, many, optional)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
@@ -24,13 +24,13 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
 import Data.Scientific (Scientific, toRealFloat)
-import qualified Data.Scientific as Sci
 import Data.Word (Word8)
 import Rank2 qualified
 import Text.Grampa (InputParsing (string, anyToken), InputCharParsing (..),
                     ParseFailure (..), FailureDescription (..))
 import Text.Grampa.Combinators (concatMany, moptional, upto)
 import Text.Grampa.PEG.Backtrack qualified as PEG
+import Text.Read (readMaybe)
 
 import Text.FDF.PDF.Types
 
@@ -164,7 +164,7 @@ litEscape = string "\\" *>
 pdfOctalEscape :: PDFParser ByteString
 pdfOctalEscape = evalOctal <$> octalParser
   where
-    evalOctal = BS.singleton . fromIntegral . foldl (\acc d -> 8*acc + d) 0
+    evalOctal = BS.singleton . fromIntegral . foldl' (\acc d -> 8*acc + d) 0
     octalParser = (:) <$> octDigitVal <*> upto 2 octDigitVal
 
 -- | Parse a single octal digit, returning its numeric value.
@@ -232,41 +232,24 @@ pdfRef :: PDFParser PDFValue
 pdfRef = PDFRef <$> pdfUnsignedInt <* skipWS <*> pdfUnsignedInt <* skipWS <* string "R"
 
 -- | Parse a signed integer or real number (with optional scientific exponent).
+-- Collects the raw number text and delegates to 'readMaybe' for interpretation.
 pdfNum :: PDFParser PDFValue
 pdfNum = do
-  signedDigits <- unwrapBS <$>
-    (moptional (satisfyCharInput (\c -> c == '-' || c == '+')) <> takeCharsWhile1 isDigit)
-  let n   = maybe 0 fst (BSC.readInt signedDigits)
-      neg = not (BS.null signedDigits) && BSC.head signedDigits == '-'
-  PDFReal . toRealFloat <$> pdfRealTail (abs n) neg
-    <|> pure (PDFInt n)
-
--- | Parse the fractional part (@.digits@) and optional exponent, returning a
--- 'Scientific' value.  @absInt@ is the absolute value of the integer part;
--- @neg@ is 'True' for a negative number.
-pdfRealTail :: Int -> Bool -> PDFParser Scientific
-pdfRealTail absInt neg = do
-  _ <- string "."
-  fracDigits <- unwrapBS <$> takeCharsWhile isDigit
-  let fracLen = BS.length fracDigits
-      fracN   = maybe 0 fst (BSC.readInt fracDigits)
-      coeff   = toInteger absInt * 10 ^ fracLen + toInteger fracN
-  pdfExpTail (Sci.scientific (if neg then negate coeff else coeff) (negate fracLen))
-
--- | Consume an optional scientific-notation exponent (@e±N@ or @E±N@),
--- returning an updated 'Scientific'.
---
--- If the @e@\/@E@ is not followed by at least one digit (e.g. a bare @e@
--- that begins a subsequent keyword like @endobj@), the @e@\/@E@ is left
--- unconsumed and the value is returned unchanged.
-pdfExpTail :: Scientific -> PDFParser Scientific
-pdfExpTail sci =
-  ( do _ <- satisfyCharInput (\c -> c == 'e' || c == 'E')
-       expSign <- ((-1) <$ string "-") <|> (1 <$ string "+") <|> pure 1
-       expDigits <- unwrapBS <$> takeCharsWhile1 isDigit
-       let e = expSign * maybe 0 fst (BSC.readInt expDigits)
-       return (Sci.scientific (Sci.coefficient sci) (Sci.base10Exponent sci + e))
-  ) <|> pure sci
+  numStr <- BSC.unpack . unwrapBS <$>
+    (  moptional (satisfyCharInput (\c -> c == '-' || c == '+'))
+    <> takeCharsWhile1 isDigit
+    <> moptional (string "." <> takeCharsWhile isDigit)
+    <> moptional (  satisfyCharInput (\c -> c == 'e' || c == 'E')
+                 <> moptional (satisfyCharInput (\c -> c == '+' || c == '-'))
+                 <> takeCharsWhile1 isDigit)
+    )
+  if any (\c -> c == '.' || c == 'e' || c == 'E') numStr
+    then case readMaybe numStr of
+           Just s  -> pure (PDFReal (toRealFloat (s :: Scientific)))
+           Nothing -> empty
+    else case BSC.readInt (BSC.pack numStr) of
+           Just (n, _) -> pure (PDFInt n)
+           Nothing     -> empty
 
 -- ---------------------------------------------------------------------------
 -- Whitespace / utility helpers

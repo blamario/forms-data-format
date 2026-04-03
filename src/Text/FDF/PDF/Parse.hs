@@ -18,13 +18,13 @@ module Text.FDF.PDF.Parse (
 import Control.Applicative ((<|>), empty, many, optional)
 import Control.Monad (void)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
-import qualified Data.ByteString.Char8 as BSC
+import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BSC
 import Data.Char (isDigit, isHexDigit, isSpace, ord)
 import Data.Int (Int64)
 import Data.List (intercalate)
 import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
+import Data.Map.Strict qualified as Map
 import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
 import Data.Scientific (Scientific, toRealFloat)
 import Data.Word (Word8)
@@ -33,6 +33,7 @@ import Text.Grampa (InputParsing (string, anyToken), InputCharParsing (..),
                     ParseFailure (..), FailureDescription (..))
 import Text.Grampa.Combinators (concatMany, moptional, upto)
 import Text.Grampa.PEG.Backtrack qualified as PEG
+import Text.Parser.Char qualified as Char
 import Text.Read (readMaybe)
 
 import Text.FDF.PDF.Types
@@ -167,8 +168,7 @@ pdfOctalEscape = evalOctal <$> octalParser
 
 -- | Parse a single octal digit, returning its numeric value.
 octDigitVal :: PDFParser Int
-octDigitVal = fmap (\(ByteStringUTF8 bs) -> ord (BSC.head bs) - 0x30)
-                   (satisfyCharInput isOctChar)
+octDigitVal = fmap (\c-> ord c - ord '0') (Char.satisfy isOctChar)
 
 -- ---------------------------------------------------------------------------
 -- Hex string
@@ -185,8 +185,7 @@ pdfHexBody = BS.pack <$> many hexBytePair <* skipWS
                     <$> (skipWS *> hexNibble)
                     <*> (skipWS *> (hexNibble <|> pure 0))
     toHexByte h1 h2 = fromIntegral (h1*16 + h2) :: Word8
-    hexNibble = fmap (\(ByteStringUTF8 bs) -> hexDigit (BSC.head bs))
-                     (satisfyCharInput isHexDigit)
+    hexNibble = hexDigit <$> Char.satisfy isHexDigit
 
 -- ---------------------------------------------------------------------------
 -- Array

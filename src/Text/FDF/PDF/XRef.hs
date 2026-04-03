@@ -1,3 +1,4 @@
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
@@ -9,7 +10,7 @@
 
 module Text.FDF.PDF.XRef (parseXRefChain) where
 
-import Control.Monad (when)
+import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
@@ -18,9 +19,16 @@ import Data.Int (Int64)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (catMaybes, mapMaybe)
+import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
+import Data.Traversable (for)
+import Text.Grampa (InputParsing (anyToken, getInput, string), InputCharParsing (..),
+                    ParseFailure (..), FailureDescription (..), lookAhead, (<?>), (<<|>))
+import Text.Grampa.Combinators (concatMany, moptional, upto)
+import Text.Grampa.PEG.Backtrack qualified as PEG
 
 import Text.FDF.PDF.Decompress (decompressStream)
-import Text.FDF.PDF.Parse (dropWS, isPDFWS, parseDict, readDecimal)
+import Text.FDF.PDF.Parse (PDFParser, runParser, dropWS, parseDict, pdfDict, pdfUnsignedInt, readDecimal, skipWS)
 import Text.FDF.PDF.Types
 
 -- | Parse the full chain of cross-reference tables, following @/Prev@ and
@@ -56,51 +64,44 @@ parseOneXRef :: ByteString -> Int64 -> Either String (XRef, Map ByteString PDFVa
 parseOneXRef bs off = do
   let chunk = BS.drop (fromIntegral off) bs
   if "xref" `BS.isPrefixOf` chunk
-    then parseTraditionalXRef chunk
+    then fst <$> runParser traditionalXRef chunk
     else parseXRefStream bs off
 
 -- ---------------------------------------------------------------------------
 -- Traditional (table-based) cross-reference section
 
 -- | Parse a traditional (table-based) cross-reference section and its trailer.
-parseTraditionalXRef :: ByteString -> Either String (XRef, Map ByteString PDFValue)
-parseTraditionalXRef raw = do
-  -- Skip "xref" + whitespace
-  let bs0 = dropWS (BS.drop 4 raw)
-  (bs1, xref) <- parseSubsections bs0 IntMap.empty
-  -- bs1 should now start with "trailer"
-  let afterTrailer = dropWS (BS.drop 7 bs1)  -- skip "trailer"
-  case parseDict afterTrailer of
-    Left err       -> Left ("Trailer dict parse error: " <> err)
-    Right (td, _)  -> Right (xref, td)
+traditionalXRef :: PDFParser (XRef, Map ByteString PDFValue)
+traditionalXRef = do
+  string "xref"
+  skipWS
+  xref <- pdfSubsections
+  string "trailer"
+  skipWS
+  td <- pdfDict
+  pure (xref, td)
 
--- | Parse zero or more xref subsections, stopping at "trailer".
-parseSubsections :: ByteString -> XRef -> Either String (ByteString, XRef)
-parseSubsections bs xref =
-  -- Drop any whitespace between subsections (or before "trailer").
-  let bs' = dropWS bs
-  in if "trailer" `BS.isPrefixOf` bs'
-       then Right (bs', xref)
-       else do
-         (bs'', entries) <- parseSubsection bs'
-         parseSubsections bs'' (IntMap.union entries xref)
+-- | Zero or more xref subsections, stopping at "trailer".
+pdfSubsections :: PDFParser XRef
+pdfSubsections = concatMany (skipWS *> pdfSubsection)
 
--- | Parse one xref subsection: @firstObj count\n@ followed by entries.
-parseSubsection :: ByteString -> Either String (ByteString, XRef)
-parseSubsection bs0 = do
-  let (firstStr, r1) = BSC.span isDigit bs0
-  when (BS.null firstStr) $ Left "Expected object number in xref subsection"
-  firstObj <- readDecimal firstStr
-  let (countStr, r2) = BSC.span isDigit (dropWS1 r1)
-  when (BS.null countStr) $ Left "Expected count in xref subsection"
-  count <- readDecimal countStr
-  let r3      = dropLineEnd r2
-      entries = IntMap.fromList
-                  [ (firstObj + i, e)
-                  | i <- [0 .. count - 1]
-                  , Just e <- [parseXRefEntry (BS.take 20 (BS.drop (i * 20) r3))]
-                  ]
-  Right (BS.drop (count * 20) r3, entries)
+--- | One xref subsection: @firstObj count\n@ followed by entries.
+pdfSubsection :: PDFParser XRef
+pdfSubsection = do
+  firstObj <- pdfUnsignedInt <?> "object number in xref subsection"
+  skipWS
+  objectCount <- pdfUnsignedInt <?> "count in xref subsection"
+  skipLineEnd
+  IntMap.fromList . mapMaybe sequence
+    <$> for [firstObj .. firstObj+objectCount-1] (\i-> (,) i <$> xrefEntry)
+
+-- | One 20-byte xref entry.  Returns 'Nothing' for free entries.
+xrefEntry :: PDFParser (Maybe XRefEntry)
+xrefEntry = do
+  ByteStringUTF8 bs <- getInput
+  let entry = BS.take 20 bs
+  string (ByteStringUTF8 entry)
+  pure (parseXRefEntry entry)
 
 -- | Parse one 20-byte xref entry.  Returns 'Nothing' for free entries.
 parseXRefEntry :: ByteString -> Maybe XRefEntry
@@ -226,17 +227,6 @@ parseXRefStreamEntries w1 w2 w3 subsections streamBytes =
 readBEBytes :: Int -> ByteString -> Int
 readBEBytes n bs = BS.foldl' (\acc b -> acc * 256 + fromIntegral b) 0 (BS.take n bs)
 
--- | Drop exactly one PDF whitespace character, or nothing.
-dropWS1 :: ByteString -> ByteString
-dropWS1 bs = case BSC.uncons bs of
-  Just (c, r) | isPDFWS c -> r
-  _                       -> bs
-
--- | Drop a line ending (CR, LF, or CRLF) from the front.
-dropLineEnd :: ByteString -> ByteString
-dropLineEnd bs = case BSC.uncons bs of
-  Just (' ',  r) -> dropLineEnd r
-  Just ('\r', r) -> case BSC.uncons r of
-                      Just ('\n', r') -> r'
-                      _               -> r
-  Just ('\n', r) -> r
+-- | Skip a line ending (CR, LF, or CRLF) from the front.
+skipLineEnd :: PDFParser ()
+skipLineEnd = takeCharsWhile (== ' ') *> void (string "\r\n" <<|> string "\r" <<|> string "\n")

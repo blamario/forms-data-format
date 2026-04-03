@@ -9,7 +9,10 @@
 -- * §7.3 – Objects (booleans, numbers, strings, names, arrays, dictionaries)
 
 module Text.FDF.PDF.Parse (
-  parseDict, parseIndirectObject, parseValue, dropWS, isPDFWS, hexDigit, readDecimal
+  PDFParser, runParser,
+  parseDict, parseIndirectObject, parseValue,
+  pdfDict, pdfUnsignedInt,
+  hexDigit, dropWS, isPDFWS, readDecimal, skipWS
 ) where
 
 import Control.Applicative ((<|>), empty, many, optional)

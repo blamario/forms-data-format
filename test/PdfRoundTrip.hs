@@ -110,6 +110,10 @@ runTest failRef testName action = do
 makeFillFDF :: Field -> FDF
 makeFillFDF f = FDF "1 0 obj\n" f "endobj\ntrailer\n\n<<\n/Root 1 0 R\n>>\n"
 
+-- | Extract the 'FieldContent' from a 'PDF''s form body.
+formContent :: PDF -> FieldContent
+formContent = content . body . form
+
 -- ---------------------------------------------------------------------------
 -- Tests
 
@@ -132,7 +136,7 @@ testParseRadio ref =
   case parsePDF radioPDF of
     Left err  -> modifyIORef ref (("parsePDF radioPDF: " <> err) :)
     Right pdf ->
-      case content (body (form pdf)) of
+      case formContent pdf of
         Children kids -> do
           assertM ref ("Expected 2 top-level children, got " <> show (length kids))
                       (length kids == 2)
@@ -158,7 +162,7 @@ testFillSimple ref =
            Left err     -> modifyIORef ref (("fillPDF simplePDF: " <> err) :)
            Right filled ->
               assertM ref "filled value should be 'World'" $
-                content (body (form filled)) == FieldValue "World"
+                formContent filled == FieldValue "World"
 
 -- | fillPDF on a radio-button PDF should allow updating the text field
 -- and the result should round-trip correctly.
@@ -171,7 +175,7 @@ testFillRadio ref =
          case fillPDF fdf pdf of
            Left err     -> modifyIORef ref (("fillPDF radioPDF: " <> err) :)
            Right filled ->
-              case content (body (form filled)) of
+              case formContent filled of
                 Children kids ->
                   let textFields = filter (\k -> name k == "TextField1") kids
                   in assertM ref "TextField1 should be 'Filled'" $
@@ -192,7 +196,7 @@ testEmptyNameRoundTrip ref =
          case fillPDF fdf pdf of
            Left err     -> modifyIORef ref (("fillPDF radioPDF: " <> err) :)
            Right filled ->
-              case content (body (form filled)) of
+              case formContent filled of
                 Children kids ->
                   let radioKids = filter (\k -> name k == "RadioGroup") kids
                   in assertM ref "radio /V / should survive round-trip" $
@@ -214,7 +218,7 @@ testFloatRectRoundTrip ref =
            Left err     -> modifyIORef ref (("fillPDF floatRectPDF: " <> err) :)
            Right filled ->
               assertM ref "FloatField value should be 'OK'" $
-                content (body (form filled)) == FieldValue "OK"
+                formContent filled == FieldValue "OK"
 
 -- | fillPDF should be idempotent: applying the same FDF twice produces the
 -- same byte output as applying it once.

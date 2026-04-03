@@ -122,7 +122,7 @@ handleOp ts stk "TD" rest =
   in runStream ts { tsX = tsX ts + tx, tsY = tsY ts + ty, tsLead = negate ty } [] rest
 handleOp ts _stk "T*" rest =
   -- Move to start of next line (0 -TL Td)
-  runStream ts { tsX = tsX ts, tsY = tsY ts - tsLead ts } [] rest
+  runStream ts { tsY = tsY ts - tsLead ts } [] rest
 handleOp ts stk "Tj" rest =
   -- (string) Tj — show text
   let frag = case stk of

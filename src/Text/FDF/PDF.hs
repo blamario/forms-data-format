@@ -513,20 +513,22 @@ unique = go []
       | x `elem` seen = go seen xs
       | otherwise      = x : go (x : seen) xs
 
+-- | Proximity margin in PDF points (1 pt = 1\/72 inch).  Text fragments
+-- within this distance of a field's bounding box are considered nearby
+-- labels.  60 pt ≈ 0.83 in — generous enough to catch labels placed above,
+-- below, or to the left\/right of typical form fields.
+proximityMargin :: Double
+proximityMargin = 60
+
 -- | Determine whether a 'TextFragment' is "nearby" a 'FieldRect'.
 -- Uses a simple heuristic: the text must be on the same page and within
--- a threshold distance of the field's bounding box.
+-- 'proximityMargin' of the field's bounding box.
 isNearby :: FieldRect -> TextFragment -> Bool
 isNearby fr tf =
-  let -- Expand the field rect by a margin (in points).
-      -- 72 pt = 1 inch; we use a generous margin to catch labels above, left
-      -- of, or right of the field.
-      margin = 60 :: Double
-      tx = fragmentX tf
+  let tx = fragmentX tf
       ty = fragmentY tf
-      -- Check that the text position is within the expanded rect.
-      inXRange = tx >= frLLX fr - margin && tx <= frURX fr + margin
-      inYRange = ty >= frLLY fr - margin && ty <= frURY fr + margin
+      inXRange = tx >= frLLX fr - proximityMargin && tx <= frURX fr + proximityMargin
+      inYRange = ty >= frLLY fr - proximityMargin && ty <= frURY fr + proximityMargin
   in inXRange && inYRange && not (Text.null (Text.strip (fragmentText tf)))
 
 -- ---------------------------------------------------------------------------

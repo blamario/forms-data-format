@@ -101,6 +101,8 @@ fillPDF fdf pdf = do
   let newBytes = if null newObjs
         then pdfBytes
         else appendIncrementalUpdate enc pdfBytes xrefOff trailer newObjs
+  -- Re-parse so the returned 'form' accurately reflects *all* fields in the
+  -- filled PDF (including those not mentioned in the input FDF).
   parsePDF newBytes
 
 -- | Serialize a 'PDF' value back to its byte-level representation.

@@ -10,7 +10,7 @@
 
 module Text.FDF.PDF.XRef (parseXRefChain) where
 
-import Control.Monad (void, when)
+import Control.Monad (void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
@@ -19,16 +19,14 @@ import Data.Int (Int64)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, mapMaybe)
+import Data.Maybe (mapMaybe)
 import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
 import Data.Traversable (for)
-import Text.Grampa (InputParsing (anyToken, getInput, string), InputCharParsing (..),
-                    ParseFailure (..), FailureDescription (..), lookAhead, (<?>), (<<|>))
-import Text.Grampa.Combinators (concatMany, moptional, upto)
-import Text.Grampa.PEG.Backtrack qualified as PEG
+import Text.Grampa (InputParsing (getInput, string), InputCharParsing (..), (<?>), (<<|>))
+import Text.Grampa.Combinators (concatMany)
 
 import Text.FDF.PDF.Decompress (decompressStream)
-import Text.FDF.PDF.Parse (PDFParser, runParser, dropWS, parseDict, pdfDict, pdfUnsignedInt, readDecimal, skipWS)
+import Text.FDF.PDF.Parse (PDFParser, runParser, dropWS, parseDict, pdfDict, pdfUnsignedInt, skipWS)
 import Text.FDF.PDF.Types
 
 -- | Parse the full chain of cross-reference tables, following @/Prev@ and
@@ -72,14 +70,7 @@ parseOneXRef bs off = do
 
 -- | Parse a traditional (table-based) cross-reference section and its trailer.
 traditionalXRef :: PDFParser (XRef, Map ByteString PDFValue)
-traditionalXRef = do
-  string "xref"
-  skipWS
-  xref <- pdfSubsections
-  string "trailer"
-  skipWS
-  td <- pdfDict
-  pure (xref, td)
+traditionalXRef = (,) <$> (string "xref" *> skipWS *> pdfSubsections) <*> (string "trailer" *> skipWS *> pdfDict)
 
 -- | Zero or more xref subsections, stopping at "trailer".
 pdfSubsections :: PDFParser XRef
@@ -100,7 +91,7 @@ xrefEntry :: PDFParser (Maybe XRefEntry)
 xrefEntry = do
   ByteStringUTF8 bs <- getInput
   let entry = BS.take 20 bs
-  string (ByteStringUTF8 entry)
+  _ <- string (ByteStringUTF8 entry)
   pure (parseXRefEntry entry)
 
 -- | Parse one 20-byte xref entry.  Returns 'Nothing' for free entries.

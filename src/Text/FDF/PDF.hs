@@ -36,7 +36,7 @@ import qualified Data.Text.Encoding as Text
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
 import Text.FDF.PDF.Decompress (decompressStream)
 import Text.FDF.PDF.Decrypt (Decryptor, Encryptor, buildDecryptor)
-import Text.FDF.PDF.Parse (parseIndirectObject, parseValue, dropWS, parseDict, readDecimal)
+import Text.FDF.PDF.Parse (parseIndirectObject, parseValue, dropWS, parseDict)
 import Text.FDF.PDF.Serialize (applyUpdate, appendIncrementalUpdate)
 import Text.FDF.PDF.Types
 import Text.FDF.PDF.XRef (parseXRefChain)
@@ -49,7 +49,7 @@ import Text.FDF.PDF.XRef (parseXRefChain)
 -- object streams.
 parsePDF :: ByteString -> Either String FDF
 parsePDF bs = do
-  (_, xref, trailer, dec, _enc, fieldsArr) <- loadAcroFormFields bs
+  (_, xref, _trailer, dec, _enc, fieldsArr) <- loadAcroFormFields bs
   fields <- catMaybes <$> mapM (loadFieldObj bs xref dec) fieldsArr
   case fields of
     []  -> Left "PDF has no AcroForm fields"
@@ -187,8 +187,8 @@ loadFromObjStream bs xref dec stmObjNum idx = do
     case drop idx offsets of
       (entry : _) -> Right entry
       []          -> Left $ "Object stream index " <> show idx <> " out of range (n=" <> show n <> ")"
-  let body = BS.drop (first + relOff) streamBytes
-  fst <$> parseValue (dropWS body)
+  let objBody = BS.drop (first + relOff) streamBytes
+  fst <$> parseValue (dropWS objBody)
 
 -- | Like 'parseStreamAt' but resolves an indirect @\/Length@ reference and
 -- applies the decryptor before decompression.
@@ -248,9 +248,9 @@ parseObjStmHeader bs n = go (dropWS bs) n []
       in if BS.null numStr || BS.null offStr
          then Left "Truncated object stream header"
          else do
-           n <- readDecimal numStr
-           o <- readDecimal offStr
-           go (dropWS r2) (k - 1) ((n, o) : acc)
+           num <- readDecimal numStr
+           off <- readDecimal offStr
+           go (dropWS r2) (k - 1) ((num, off) : acc)
 
 -- ---------------------------------------------------------------------------
 -- AcroForm field loading
@@ -394,7 +394,7 @@ collectUpdates prefix Field { name = n, content = cont } =
     Children kids    -> concatMap (collectUpdates path) kids
 
 -- ---------------------------------------------------------------------------
--- Dictionary lookup helpers
+-- helpers
 
 dictLookupRef :: ByteString -> Map ByteString PDFValue -> Either String (Int, Int)
 dictLookupRef key d =
@@ -422,3 +422,10 @@ loadArray bs xref dec key d =
         _          -> Left ("/" <> BSC.unpack key <> " reference is not an array")
     Just _ -> Left ("/" <> BSC.unpack key <> " is not an array")
     Nothing -> Left ("/" <> BSC.unpack key <> " not found in dict")
+
+-- | Read a non-negative decimal integer from a 'ByteString', failing with
+-- an error if the input does not start with at least one digit.
+readDecimal :: ByteString -> Either String Int
+readDecimal bs = case BSC.readInt bs of
+  Just (n, _) -> Right n
+  Nothing     -> Left ("Expected decimal integer, got: " <> BSC.unpack (BS.take 10 bs))

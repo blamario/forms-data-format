@@ -12,10 +12,11 @@ module Text.FDF.PDF.Parse (
   PDFParser, runParser,
   parseDict, parseIndirectObject, parseValue,
   pdfDict, pdfUnsignedInt,
-  hexDigit, dropWS, isPDFWS, readDecimal, skipWS
+  hexDigit, dropWS, isPDFWS, skipWS
 ) where
 
 import Control.Applicative ((<|>), empty, many, optional)
+import Control.Monad (void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
@@ -114,8 +115,8 @@ pdfValue = skipWS *>
   )
 
 -- | Skip zero or more PDF whitespace characters.
-skipWS :: PDFParser ByteStringUTF8
-skipWS = takeCharsWhile isPDFWS
+skipWS :: PDFParser ()
+skipWS = void $ takeCharsWhile isPDFWS
 
 -- ---------------------------------------------------------------------------
 -- Literal string
@@ -254,13 +255,6 @@ pdfNum = do
 -- | Drop PDF whitespace (space, tab, CR, LF, FF, NUL) from the front.
 dropWS :: ByteString -> ByteString
 dropWS = BSC.dropWhile isPDFWS
-
--- | Read a non-negative decimal integer from a 'ByteString', failing with
--- an error if the input does not start with at least one digit.
-readDecimal :: ByteString -> Either String Int
-readDecimal bs = case BSC.readInt bs of
-  Just (n, _) -> Right n
-  Nothing     -> Left ("Expected decimal integer, got: " <> BSC.unpack (BS.take 10 bs))
 
 -- | Convert a hex digit character to its integer value (0–15).
 hexDigit :: Char -> Int

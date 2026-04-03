@@ -10,7 +10,8 @@ import Data.List (foldl')
 import System.Exit (exitFailure, exitSuccess)
 
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
-import Text.FDF.PDF (PDF (..), parsePDF, fillPDF, serializePDF)
+import Text.FDF.PDF (PDF (..), parsePDF, fillPDF, serializePDF, fieldLabels)
+import qualified Data.Map.Strict as Map
 
 -- ---------------------------------------------------------------------------
 -- Minimal test PDF construction
@@ -94,6 +95,25 @@ noFieldsPDF = makePDF
   , "<< /Type /Pages /Kids [] /Count 0 >>"
   , "<< /Fields [] >>"
   ]
+
+-- | A PDF with page content stream text that labels form fields.
+-- "First Name:" is drawn near the @FirstName@ field,
+-- "Email:" is drawn near the @Email@ field.
+labelledPDF :: BS.ByteString
+labelledPDF =
+  let streamData = "BT\n/Helv 12 Tf\n1 0 0 1 100 750 Tm\n(First Name:) Tj\n1 0 0 1 100 650 Tm\n(Email:) Tj\nET"
+      streamObj  = "<< /Length " <> BSC.pack (show (BS.length streamData))
+                    <> " >>\nstream\n" <> streamData <> "\nendstream"
+  in makePDF
+    [ "<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>"
+    , "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>"
+    , "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Annots [ 7 0 R 8 0 R ] /Resources << /Font << /Helv 5 0 R >> >> >>"
+    , streamObj
+    , "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+    , "<< /Fields [ 7 0 R 8 0 R ] /DR << /Font << /Helv 5 0 R >> >> >>"
+    , "<< /Type /Annot /Subtype /Widget /FT /Tx /T (FirstName) /V () /Rect [100 730 400 745] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>"
+    , "<< /Type /Annot /Subtype /Widget /FT /Tx /T (Email) /V () /Rect [100 630 400 645] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>"
+    ]
 
 -- ---------------------------------------------------------------------------
 -- Test runner
@@ -297,6 +317,41 @@ testFillNoFields ref =
              assertM ref "filled noFieldsPDF: form body should be Children []" $
                formContent filled == Children []
 
+-- | fieldLabels should associate page text fragments with nearby form fields.
+testFieldLabels :: FailRef -> IO ()
+testFieldLabels ref =
+  case parsePDF labelledPDF of
+    Left err  -> modifyIORef ref (("parsePDF labelledPDF: " <> err) :)
+    Right pdf ->
+      case fieldLabels pdf of
+        Left err -> modifyIORef ref (("fieldLabels: " <> err) :)
+        Right m  -> do
+          assertM ref "fieldLabels: FirstName should have label 'First Name:'" $
+            case Map.lookup "FirstName" m of
+              Just labels -> "First Name:" `elem` labels
+              Nothing     -> False
+          assertM ref "fieldLabels: Email should have label 'Email:'" $
+            case Map.lookup "Email" m of
+              Just labels -> "Email:" `elem` labels
+              Nothing     -> False
+          -- "First Name:" should NOT be associated with the Email field
+          assertM ref "fieldLabels: Email should not have 'First Name:'" $
+            case Map.lookup "Email" m of
+              Just labels -> "First Name:" `notElem` labels
+              Nothing     -> True
+
+-- | fieldLabels on a PDF with no form fields should return an empty map.
+testFieldLabelsNoFields :: FailRef -> IO ()
+testFieldLabelsNoFields ref =
+  case parsePDF noFieldsPDF of
+    Left err  -> modifyIORef ref (("parsePDF noFieldsPDF: " <> err) :)
+    Right pdf ->
+      case fieldLabels pdf of
+        Left err -> modifyIORef ref (("fieldLabels noFields: " <> err) :)
+        Right m  ->
+          assertM ref "fieldLabels: empty map for no-field PDF" $
+            Map.null m
+
 -- ---------------------------------------------------------------------------
 -- Main
 
@@ -314,6 +369,8 @@ main = do
   run "float /Rect coords survive round-trip" testFloatRectRoundTrip
   run "binary bytes in literal string"        testBinaryStringParse
   run "fillPDF is idempotent"                testFillIdempotent
+  run "fieldLabels maps text to fields"      testFieldLabels
+  run "fieldLabels on no-field PDF"          testFieldLabelsNoFields
   failures <- readIORef failRef
   if null failures
     then do

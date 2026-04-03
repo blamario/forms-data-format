@@ -17,6 +17,7 @@ module Text.FDF.PDF
   , parsePDF
   , fillPDF
   , serializePDF
+  , fieldLabels
   ) where
 
 import Data.ByteString (ByteString)
@@ -36,6 +37,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
+import Text.FDF.PDF.ContentStream (TextFragment (..), extractTextFragments)
 import Text.FDF.PDF.Decompress (decompressStream)
 import Text.FDF.PDF.Decrypt (Decryptor, Encryptor, buildDecryptor)
 import Text.FDF.PDF.Parse (parseIndirectObject, parseValue, dropWS, parseDict)
@@ -453,3 +455,183 @@ readDecimal :: ByteString -> Either String Int
 readDecimal bs = case BSC.readInt bs of
   Just (n, _) -> Right n
   Nothing     -> Left ("Expected decimal integer, got: " <> BSC.unpack (BS.take 10 bs))
+
+-- ---------------------------------------------------------------------------
+-- Field labels: text fragments associated with form fields
+
+-- | A form field's bounding rectangle and page object number, as extracted
+-- from its widget annotation dictionary.
+data FieldRect = FieldRect
+  { frName :: Text     -- ^ fully-qualified field name
+  , frPage :: Int      -- ^ page object number (/P reference)
+  , frLLX  :: Double   -- ^ lower-left x
+  , frLLY  :: Double   -- ^ lower-left y
+  , frURX  :: Double   -- ^ upper-right x
+  , frURY  :: Double   -- ^ upper-right y
+  }
+
+-- | Extract a mapping from form field names to nearby text fragments.
+--
+-- For each form field the function:
+--
+-- 1. reads the widget annotation's @\/Rect@ and @\/P@ (page reference);
+-- 2. loads and decompresses the page's @\/Contents@ stream;
+-- 3. extracts positioned text fragments from the content stream;
+-- 4. selects text whose position is close to the field's rectangle.
+--
+-- The result maps each field name to the list of text fragments that are
+-- nearby (typically the label drawn next to the form field on the page).
+-- Fields without a @\/Rect@ or @\/P@ entry are silently omitted.
+fieldLabels :: PDF -> Either String (Map Text [Text])
+fieldLabels pdf = do
+  let bs = source pdf
+  (_, xref, _trailer, dec, _enc, fieldsArr) <- loadAcroFormFields bs
+  -- Collect field rects from widget annotations.
+  rects <- collectFieldRects bs xref dec [] fieldsArr
+  if null rects
+    then Right Map.empty
+    else do
+      -- Load text fragments for every page that has at least one field.
+      let pageObjNums = unique [frPage r | r <- rects]
+      pageTexts <- mapM (loadPageText bs xref dec) pageObjNums
+      let pageTextMap = Map.fromList (zip pageObjNums pageTexts)
+      -- Match each field to nearby text.
+      Right $ Map.fromListWith (++)
+        [ (frName r, nearby)
+        | r <- rects
+        , let frags = fromMaybe [] (Map.lookup (frPage r) pageTextMap)
+              nearby = [fragmentText f | f <- frags, isNearby r f]
+        , not (null nearby)
+        ]
+
+-- | Deduplicate a list preserving order.
+unique :: Eq a => [a] -> [a]
+unique = go []
+  where
+    go _ []     = []
+    go seen (x:xs)
+      | x `elem` seen = go seen xs
+      | otherwise      = x : go (x : seen) xs
+
+-- | Determine whether a 'TextFragment' is "nearby" a 'FieldRect'.
+-- Uses a simple heuristic: the text must be on the same page and within
+-- a threshold distance of the field's bounding box.
+isNearby :: FieldRect -> TextFragment -> Bool
+isNearby fr tf =
+  let -- Expand the field rect by a margin (in points).
+      -- 72 pt = 1 inch; we use a generous margin to catch labels above, left
+      -- of, or right of the field.
+      margin = 60 :: Double
+      tx = fragmentX tf
+      ty = fragmentY tf
+      -- Check that the text position is within the expanded rect.
+      inXRange = tx >= frLLX fr - margin && tx <= frURX fr + margin
+      inYRange = ty >= frLLY fr - margin && ty <= frURY fr + margin
+  in inXRange && inYRange && not (Text.null (Text.strip (fragmentText tf)))
+
+-- ---------------------------------------------------------------------------
+-- Field rect collection
+
+-- | Walk the field hierarchy and collect 'FieldRect' entries for each leaf
+-- widget annotation that has both a @\/Rect@ and a @\/P@ entry.
+collectFieldRects
+  :: ByteString -> XRef -> Decryptor
+  -> [Text]        -- ^ path prefix
+  -> [PDFValue]    -- ^ field / widget references
+  -> Either String [FieldRect]
+collectFieldRects bs xref dec prefix refs =
+  concat <$> mapM (collectFieldRect bs xref dec prefix) refs
+
+collectFieldRect
+  :: ByteString -> XRef -> Decryptor
+  -> [Text]
+  -> PDFValue
+  -> Either String [FieldRect]
+collectFieldRect bs xref dec prefix ref = do
+  obj <- loadObject bs xref dec ref
+  dict <- case obj of
+            PDFDict d -> Right d
+            _         -> Right Map.empty  -- skip non-dicts
+  let nameM = case Map.lookup "T" dict of
+                Just (PDFString s) -> Just (decodePDFString s)
+                Just (PDFName nm)  -> Just (Text.decodeLatin1 nm)
+                _                  -> Nothing
+      path = case nameM of
+               Just n  -> prefix ++ [n]
+               Nothing -> prefix
+      qualName = Text.intercalate "." path
+  case Map.lookup "Kids" dict of
+    Just (PDFArray kids) -> do
+      childRects <- collectFieldRects bs xref dec path kids
+      if null childRects
+        then extractRect dict qualName  -- leaf (all kids are widgets)
+        else Right childRects
+    Just kidRef@PDFRef{} -> do
+      kidsVal <- loadObject bs xref dec kidRef
+      case kidsVal of
+        PDFArray kids -> do
+          childRects <- collectFieldRects bs xref dec path kids
+          if null childRects
+            then extractRect dict qualName
+            else Right childRects
+        _ -> extractRect dict qualName
+    _ -> extractRect dict qualName
+
+-- | Try to extract a 'FieldRect' from a field/widget dictionary.
+-- Returns an empty list if @\/Rect@ or @\/P@ is missing.
+extractRect :: Map ByteString PDFValue -> Text -> Either String [FieldRect]
+extractRect dict qualName
+  | Text.null qualName = Right []
+  | otherwise = case (Map.lookup "Rect" dict, Map.lookup "P" dict) of
+      (Just (PDFArray [a, b, c, d]), Just (PDFRef pn _)) ->
+        case (toDouble a, toDouble b, toDouble c, toDouble d) of
+          (Just llx, Just lly, Just urx, Just ury) ->
+            Right [FieldRect qualName pn llx lly urx ury]
+          _ -> Right []
+      _ -> Right []
+
+-- | Convert a 'PDFValue' to 'Double'.
+toDouble :: PDFValue -> Maybe Double
+toDouble (PDFInt n)  = Just (fromIntegral n)
+toDouble (PDFReal r) = Just r
+toDouble _           = Nothing
+
+-- ---------------------------------------------------------------------------
+-- Page content stream loading
+
+-- | Load and decompress the content stream(s) for a page identified by
+-- its object number.  Returns positioned text fragments.
+loadPageText :: ByteString -> XRef -> Decryptor -> Int -> Either String [TextFragment]
+loadPageText bs xref dec pageObjNum = do
+  pageDict <- loadDict bs xref dec (pageObjNum, 0)
+  contentsBytes <- loadContents bs xref dec pageObjNum pageDict
+  Right (extractTextFragments contentsBytes)
+
+-- | Load and concatenate the page's @\/Contents@ stream(s).
+-- @\/Contents@ may be a single stream reference or an array of references.
+loadContents
+  :: ByteString -> XRef -> Decryptor
+  -> Int                          -- ^ page object number
+  -> Map ByteString PDFValue
+  -> Either String ByteString
+loadContents bs xref dec _pageObjNum dict =
+  case Map.lookup "Contents" dict of
+    Nothing -> Right BS.empty  -- page with no content stream
+    Just (PDFRef n _) -> loadStreamBytes bs xref dec n
+    Just (PDFArray refs) -> do
+      chunks <- mapM (loadContentRef bs xref dec) refs
+      Right (BS.concat chunks)
+    _ -> Right BS.empty
+
+loadContentRef :: ByteString -> XRef -> Decryptor -> PDFValue -> Either String ByteString
+loadContentRef bs xref dec (PDFRef n _) = loadStreamBytes bs xref dec n
+loadContentRef _ _ _ _                  = Right BS.empty
+
+-- | Load a stream object by object number: parse, decrypt, and decompress.
+loadStreamBytes :: ByteString -> XRef -> Decryptor -> Int -> Either String ByteString
+loadStreamBytes bs xref dec objNum = do
+  off <- case IntMap.lookup objNum xref of
+    Just (XRefOffset o) -> Right o
+    _                   -> Left $ "Content stream object " <> show objNum <> " not at a byte offset"
+  (dict, rawBytes) <- parseStreamAtIndirectLen bs xref dec objNum off
+  decompressStream dict rawBytes

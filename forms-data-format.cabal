@@ -26,7 +26,8 @@ source-repository head
 library
     exposed-modules:  Text.FDF
                       Text.FDF.PDF
-    other-modules:    Text.FDF.PDF.Decompress
+    other-modules:    Text.FDF.PDF.ContentStream
+                      Text.FDF.PDF.Decompress
                       Text.FDF.PDF.Decrypt
                       Text.FDF.PDF.Parse
                       Text.FDF.PDF.Serialize
@@ -88,4 +89,5 @@ test-suite pdf-round-trip
     hs-source-dirs:   test
     default-language: Haskell2010
     build-depends:    base == 4.*, bytestring,
+                      containers >= 0.6 && < 0.9,
                       forms-data-format

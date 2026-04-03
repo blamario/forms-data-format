@@ -328,27 +328,13 @@ testFieldLabels ref =
         Right fields -> do
           let findField n = [f | f <- fields, name f == n]
           case findField "FirstName" of
-            [f] -> assertM ref "fieldLabels: FirstName label should contain 'First Name:'" $
-                     case content f of
-                       FieldValue v -> "First Name:" `elem` words' v
-                       _            -> False
+            [f] -> assertM ref "fieldLabels: FirstName label should be 'First Name:'" $
+                     content f == FieldValue "First Name:"
             _   -> modifyIORef ref ("fieldLabels: FirstName field not found" :)
           case findField "Email" of
-            [f] -> do
-              assertM ref "fieldLabels: Email label should contain 'Email:'" $
-                case content f of
-                  FieldValue v -> "Email:" `elem` words' v
-                  _            -> False
-              -- "First Name:" should NOT be in the Email field's label
-              assertM ref "fieldLabels: Email should not have 'First Name:'" $
-                case content f of
-                  FieldValue v -> "First Name:" `notElem` words' v
-                  _            -> True
+            [f] -> assertM ref "fieldLabels: Email label should be 'Email:'" $
+                     content f == FieldValue "Email:"
             _   -> modifyIORef ref ("fieldLabels: Email field not found" :)
-  where
-    -- Split label text by space but keep multi-word labels intact.
-    -- The label value is a space-separated concatenation; check membership.
-    words' t = [t]  -- the label is a single text fragment per field
 
 -- | fieldLabels on a PDF with no form fields should return an empty list.
 testFieldLabelsNoFields :: FailRef -> IO ()

@@ -13,8 +13,10 @@
 -- The module is intentionally self-contained (no external PDF library dependency).
 
 module Text.FDF.PDF
-  ( parsePDF
+  ( PDF (..)
+  , parsePDF
   , fillPDF
+  , serializePDF
   ) where
 
 import Data.ByteString (ByteString)
@@ -41,17 +43,27 @@ import Text.FDF.PDF.Serialize (applyUpdate, appendIncrementalUpdate)
 import Text.FDF.PDF.Types
 import Text.FDF.PDF.XRef (parseXRefChain)
 
+-- | A parsed PDF file, containing the extracted form data and the raw PDF
+-- bytes.  The 'source' field preserves the original file content so that
+-- 'fillPDF' can apply incremental updates and 'serializePDF' can reproduce
+-- the byte-level representation.
+data PDF = PDF
+  { form   :: FDF         -- ^ the extracted AcroForm field data
+  , source :: ByteString  -- ^ the raw PDF bytes
+  } deriving (Eq, Show)
+
 -- | Extract form field data from a PDF file.
 --
--- Reads the PDF's AcroForm structure and returns the corresponding 'FDF'
--- value.  Supports both traditional (table-based) cross-reference sections
+-- Reads the PDF's AcroForm structure and returns a 'PDF' value containing
+-- the corresponding 'FDF' form data together with the original bytes.
+-- Supports both traditional (table-based) cross-reference sections
 -- and cross-reference streams (PDF 1.5+), including FlateDecode-compressed
 -- object streams.
-parsePDF :: ByteString -> Either String FDF
+parsePDF :: ByteString -> Either String PDF
 parsePDF bs = do
   (_, xref, _trailer, dec, _enc, fieldsArr) <- loadAcroFormFields bs
   fields <- catMaybes <$> mapM (loadFieldObj bs xref dec) fieldsArr
-  case fields of
+  fdf <- case fields of
     []  -> Left "PDF has no AcroForm fields"
     [f] -> Right $ FDF
              "1 0 obj\n"
@@ -61,16 +73,18 @@ parsePDF bs = do
              "1 0 obj\n"
              Field { name = "", content = Children fields }
              "endobj\ntrailer\n\n<<\n/Root 1 0 R\n>>\n"
+  Right PDF { form = fdf, source = bs }
 
--- | Fill the form fields of a PDF template using an 'FDF' value.
+-- | Fill the form fields of a PDF using an 'FDF' value.
 --
 -- Uses an incremental-update append so the original PDF bytes are left intact.
 -- For encrypted PDFs (Standard Security Handler, empty user password), the
 -- new field-value objects are AES-encrypted with the same key as the original
 -- body; the incremental update trailer carries both @\/Encrypt@ and @\/ID@ so
 -- readers can decrypt both the original body objects and the new field objects.
-fillPDF :: FDF -> ByteString -> Either String ByteString
-fillPDF fdf pdfBytes = do
+fillPDF :: FDF -> PDF -> Either String PDF
+fillPDF fdf pdf = do
+  let pdfBytes = source pdf
   (xrefOff, xref, trailer, dec, enc, fieldsArr) <- loadAcroFormFields pdfBytes
   -- Build mapping:  full path → (objNum, current dict)
   pathMap      <- buildPathMap pdfBytes xref dec [] fieldsArr
@@ -81,9 +95,14 @@ fillPDF fdf pdfBytes = do
         PDFInt n <- Map.lookup "Size" trailer
         return n
   (newObjs, _) <- foldl' (applyUpdate pathMap) (Right ([], totalObjs)) updates
-  Right $ if null newObjs
-    then pdfBytes
-    else appendIncrementalUpdate enc pdfBytes xrefOff trailer newObjs
+  let newBytes = if null newObjs
+        then pdfBytes
+        else appendIncrementalUpdate enc pdfBytes xrefOff trailer newObjs
+  parsePDF newBytes
+
+-- | Serialize a 'PDF' value back to its byte-level representation.
+serializePDF :: PDF -> ByteString
+serializePDF = source
 
 -- | Parse the PDF cross-reference tables and locate the AcroForm @\/Fields@
 -- array, returning the xref offset, xref table, trailer dictionary,

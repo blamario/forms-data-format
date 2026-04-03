@@ -11,7 +11,7 @@ import System.IO (hSetBinaryMode, stdin)
 import Options.Applicative qualified as OptsAp
 
 import Text.FDF qualified as FDF
-import Text.FDF.PDF (fillPDF)
+import Text.FDF.PDF (fillPDF, parsePDF, serializePDF)
 
 data Options = Options
   { fdfInput  :: FilePath
@@ -56,9 +56,12 @@ main = do
   fdf <- case FDF.parse fdfBytes of
     Left err  -> throwError $ "Error parsing FDF: " <> err
     Right fdf -> return fdf
-  case fillPDF fdf pdfBytes of
+  pdf <- case parsePDF pdfBytes of
+    Left err  -> throwError $ "Error parsing PDF: " <> err
+    Right pdf -> return pdf
+  case fillPDF fdf pdf of
     Left err     -> throwError $ "Error filling PDF: " <> err
     Right filled ->
       if pdfOutput opts == "-"
-        then ByteString.putStr filled
-        else ByteString.writeFile (pdfOutput opts) filled
+        then ByteString.putStr (serializePDF filled)
+        else ByteString.writeFile (pdfOutput opts) (serializePDF filled)

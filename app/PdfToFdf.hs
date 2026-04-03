@@ -9,7 +9,7 @@ import Data.ByteString qualified as ByteString
 import Options.Applicative qualified as OptsAp
 
 import Text.FDF qualified as FDF
-import Text.FDF.PDF (parsePDF)
+import Text.FDF.PDF (PDF (form), parsePDF)
 
 data Options = Options
   { input  :: FilePath
@@ -38,8 +38,8 @@ main = do
                 else ByteString.readFile (input opts)
   case parsePDF pdfBytes of
     Left err  -> ioError (userError $ "Error reading PDF: " <> err)
-    Right fdf -> do
-      let fdfBytes = FDF.serialize fdf
+    Right pdf -> do
+      let fdfBytes = FDF.serialize (form pdf)
       if output opts == "-"
         then ByteString.putStr fdfBytes
         else ByteString.writeFile (output opts) fdfBytes

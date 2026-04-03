@@ -283,6 +283,20 @@ testParseNoFields ref =
       assertM ref "noFieldsPDF: form body should be Children []" $
         formContent pdf == Children []
 
+-- | Filling a form-less PDF with an empty FDF should succeed and return
+-- the same empty form.
+testFillNoFields :: FailRef -> IO ()
+testFillNoFields ref =
+  let emptyFDF = makeFillFDF Field { name = "", content = Children [] }
+  in case parsePDF noFieldsPDF of
+       Left err  -> modifyIORef ref (("parsePDF noFieldsPDF: " <> err) :)
+       Right pdf ->
+         case fillPDF emptyFDF pdf of
+           Left err    -> modifyIORef ref (("fillPDF noFieldsPDF: " <> err) :)
+           Right filled ->
+             assertM ref "filled noFieldsPDF: form body should be Children []" $
+               formContent filled == Children []
+
 -- ---------------------------------------------------------------------------
 -- Main
 
@@ -293,6 +307,7 @@ main = do
   run "parse simple text field PDF"          testParseSimple
   run "parse radio button PDF"               testParseRadio
   run "parse PDF with no form fields"        testParseNoFields
+  run "fill form-less PDF with empty FDF"    testFillNoFields
   run "fill simple text field"               testFillSimple
   run "fill radio PDF (text field only)"     testFillRadio
   run "empty-name /V / survives round-trip"  testEmptyNameRoundTrip

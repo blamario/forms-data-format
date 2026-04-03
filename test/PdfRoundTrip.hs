@@ -11,7 +11,6 @@ import System.Exit (exitFailure, exitSuccess)
 
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
 import Text.FDF.PDF (PDF (..), parsePDF, fillPDF, serializePDF, fieldLabels)
-import qualified Data.Map.Strict as Map
 
 -- ---------------------------------------------------------------------------
 -- Minimal test PDF construction
@@ -317,7 +316,8 @@ testFillNoFields ref =
              assertM ref "filled noFieldsPDF: form body should be Children []" $
                formContent filled == Children []
 
--- | fieldLabels should associate page text fragments with nearby form fields.
+-- | fieldLabels should return a list of Fields mirroring the form hierarchy
+-- where leaf values contain nearby page text.
 testFieldLabels :: FailRef -> IO ()
 testFieldLabels ref =
   case parsePDF labelledPDF of
@@ -325,22 +325,32 @@ testFieldLabels ref =
     Right pdf ->
       case fieldLabels pdf of
         Left err -> modifyIORef ref (("fieldLabels: " <> err) :)
-        Right m  -> do
-          assertM ref "fieldLabels: FirstName should have label 'First Name:'" $
-            case Map.lookup "FirstName" m of
-              Just labels -> "First Name:" `elem` labels
-              Nothing     -> False
-          assertM ref "fieldLabels: Email should have label 'Email:'" $
-            case Map.lookup "Email" m of
-              Just labels -> "Email:" `elem` labels
-              Nothing     -> False
-          -- "First Name:" should NOT be associated with the Email field
-          assertM ref "fieldLabels: Email should not have 'First Name:'" $
-            case Map.lookup "Email" m of
-              Just labels -> "First Name:" `notElem` labels
-              Nothing     -> True
+        Right fields -> do
+          let findField n = [f | f <- fields, name f == n]
+          case findField "FirstName" of
+            [f] -> assertM ref "fieldLabels: FirstName label should contain 'First Name:'" $
+                     case content f of
+                       FieldValue v -> "First Name:" `elem` words' v
+                       _            -> False
+            _   -> modifyIORef ref ("fieldLabels: FirstName field not found" :)
+          case findField "Email" of
+            [f] -> do
+              assertM ref "fieldLabels: Email label should contain 'Email:'" $
+                case content f of
+                  FieldValue v -> "Email:" `elem` words' v
+                  _            -> False
+              -- "First Name:" should NOT be in the Email field's label
+              assertM ref "fieldLabels: Email should not have 'First Name:'" $
+                case content f of
+                  FieldValue v -> "First Name:" `notElem` words' v
+                  _            -> True
+            _   -> modifyIORef ref ("fieldLabels: Email field not found" :)
+  where
+    -- Split label text by space but keep multi-word labels intact.
+    -- The label value is a space-separated concatenation; check membership.
+    words' t = [t]  -- the label is a single text fragment per field
 
--- | fieldLabels on a PDF with no form fields should return an empty map.
+-- | fieldLabels on a PDF with no form fields should return an empty list.
 testFieldLabelsNoFields :: FailRef -> IO ()
 testFieldLabelsNoFields ref =
   case parsePDF noFieldsPDF of
@@ -348,9 +358,9 @@ testFieldLabelsNoFields ref =
     Right pdf ->
       case fieldLabels pdf of
         Left err -> modifyIORef ref (("fieldLabels noFields: " <> err) :)
-        Right m  ->
-          assertM ref "fieldLabels: empty map for no-field PDF" $
-            Map.null m
+        Right fields ->
+          assertM ref "fieldLabels: empty list for no-field PDF" $
+            null fields
 
 -- ---------------------------------------------------------------------------
 -- Main

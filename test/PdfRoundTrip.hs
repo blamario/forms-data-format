@@ -10,7 +10,7 @@ import Data.List (foldl')
 import System.Exit (exitFailure, exitSuccess)
 
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
-import Text.FDF.PDF (parsePDF, fillPDF)
+import Text.FDF.PDF (PDF (..), parsePDF, fillPDF, serializePDF)
 
 -- ---------------------------------------------------------------------------
 -- Minimal test PDF construction
@@ -118,7 +118,8 @@ testParseSimple :: FailRef -> IO ()
 testParseSimple ref =
   case parsePDF simplePDF of
     Left err  -> modifyIORef ref (("parsePDF simplePDF: " <> err) :)
-    Right fdf -> do
+    Right pdf -> do
+      let fdf = form pdf
       assertM ref "simplePDF: field name should be TextField1" $
         name (body fdf) == "TextField1"
       assertM ref "simplePDF: field value should be Hello" $
@@ -130,8 +131,8 @@ testParseRadio :: FailRef -> IO ()
 testParseRadio ref =
   case parsePDF radioPDF of
     Left err  -> modifyIORef ref (("parsePDF radioPDF: " <> err) :)
-    Right fdf ->
-      case content (body fdf) of
+    Right pdf ->
+      case content (body (form pdf)) of
         Children kids -> do
           assertM ref ("Expected 2 top-level children, got " <> show (length kids))
                       (length kids == 2)
@@ -150,54 +151,54 @@ testParseRadio ref =
 testFillSimple :: FailRef -> IO ()
 testFillSimple ref =
   let fdf = makeFillFDF Field { name = "TextField1", content = FieldValue "World" }
-  in case fillPDF fdf simplePDF of
-       Left err     -> modifyIORef ref (("fillPDF simplePDF: " <> err) :)
-       Right filled ->
-         case parsePDF filled of
-           Left err   -> modifyIORef ref (("round-trip parse: " <> err) :)
-           Right fdf2 ->
-             assertM ref "filled value should be 'World'" $
-               content (body fdf2) == FieldValue "World"
+  in case parsePDF simplePDF of
+       Left err     -> modifyIORef ref (("parsePDF simplePDF: " <> err) :)
+       Right pdf    ->
+         case fillPDF fdf pdf of
+           Left err     -> modifyIORef ref (("fillPDF simplePDF: " <> err) :)
+           Right filled ->
+              assertM ref "filled value should be 'World'" $
+                content (body (form filled)) == FieldValue "World"
 
 -- | fillPDF on a radio-button PDF should allow updating the text field
 -- and the result should round-trip correctly.
 testFillRadio :: FailRef -> IO ()
 testFillRadio ref =
   let fdf = makeFillFDF Field { name = "TextField1", content = FieldValue "Filled" }
-  in case fillPDF fdf radioPDF of
-       Left err     -> modifyIORef ref (("fillPDF radioPDF: " <> err) :)
-       Right filled ->
-         case parsePDF filled of
-           Left err   -> modifyIORef ref (("round-trip parse: " <> err) :)
-           Right fdf2 ->
-             case content (body fdf2) of
-               Children kids ->
-                 let textFields = filter (\k -> name k == "TextField1") kids
-                 in assertM ref "TextField1 should be 'Filled'" $
-                      all (\k -> content k == FieldValue "Filled") textFields
-               FieldValue v ->
-                 assertM ref "single field should be 'Filled'" (v == "Filled")
-               other ->
-                 modifyIORef ref (("Unexpected body: " <> show other) :)
+  in case parsePDF radioPDF of
+       Left err     -> modifyIORef ref (("parsePDF radioPDF: " <> err) :)
+       Right pdf    ->
+         case fillPDF fdf pdf of
+           Left err     -> modifyIORef ref (("fillPDF radioPDF: " <> err) :)
+           Right filled ->
+              case content (body (form filled)) of
+                Children kids ->
+                  let textFields = filter (\k -> name k == "TextField1") kids
+                  in assertM ref "TextField1 should be 'Filled'" $
+                       all (\k -> content k == FieldValue "Filled") textFields
+                FieldValue v ->
+                  assertM ref "single field should be 'Filled'" (v == "Filled")
+                other ->
+                  modifyIORef ref (("Unexpected body: " <> show other) :)
 
 -- | The empty-name radio button value @\/V \/@ must survive a fill-and-parse
 -- round-trip (regression for the \"Empty name\" / \"Unexpected character: e\" bug).
 testEmptyNameRoundTrip :: FailRef -> IO ()
 testEmptyNameRoundTrip ref =
   let fdf = makeFillFDF Field { name = "TextField1", content = FieldValue "X" }
-  in case fillPDF fdf radioPDF of
-       Left err     -> modifyIORef ref (("fillPDF radioPDF: " <> err) :)
-       Right filled ->
-         case parsePDF filled of
-           Left err   -> modifyIORef ref (("round-trip parse: " <> err) :)
-           Right fdf2 ->
-             case content (body fdf2) of
-               Children kids ->
-                 let radioKids = filter (\k -> name k == "RadioGroup") kids
-                 in assertM ref "radio /V / should survive round-trip" $
-                      all (\k -> content k == FieldNameValue "") radioKids
-               other ->
-                 modifyIORef ref (("Unexpected body: " <> show other) :)
+  in case parsePDF radioPDF of
+       Left err     -> modifyIORef ref (("parsePDF radioPDF: " <> err) :)
+       Right pdf    ->
+         case fillPDF fdf pdf of
+           Left err     -> modifyIORef ref (("fillPDF radioPDF: " <> err) :)
+           Right filled ->
+              case content (body (form filled)) of
+                Children kids ->
+                  let radioKids = filter (\k -> name k == "RadioGroup") kids
+                  in assertM ref "radio /V / should survive round-trip" $
+                       all (\k -> content k == FieldNameValue "") radioKids
+                other ->
+                  modifyIORef ref (("Unexpected body: " <> show other) :)
 
 -- | A fill-and-parse round-trip on a PDF whose field annotation has
 -- fractional /Rect coordinates (e.g. 0.05) whose @show@ representation
@@ -206,28 +207,31 @@ testEmptyNameRoundTrip ref =
 testFloatRectRoundTrip :: FailRef -> IO ()
 testFloatRectRoundTrip ref =
   let fdf = makeFillFDF Field { name = "FloatField", content = FieldValue "OK" }
-  in case fillPDF fdf floatRectPDF of
-       Left err     -> modifyIORef ref (("fillPDF floatRectPDF: " <> err) :)
-       Right filled ->
-         case parsePDF filled of
-           Left err   -> modifyIORef ref (("round-trip parse (floatRect): " <> err) :)
-           Right fdf2 ->
-             assertM ref "FloatField value should be 'OK'" $
-               content (body fdf2) == FieldValue "OK"
+  in case parsePDF floatRectPDF of
+       Left err     -> modifyIORef ref (("parsePDF floatRectPDF: " <> err) :)
+       Right pdf    ->
+         case fillPDF fdf pdf of
+           Left err     -> modifyIORef ref (("fillPDF floatRectPDF: " <> err) :)
+           Right filled ->
+              assertM ref "FloatField value should be 'OK'" $
+                content (body (form filled)) == FieldValue "OK"
 
 -- | fillPDF should be idempotent: applying the same FDF twice produces the
 -- same byte output as applying it once.
 testFillIdempotent :: FailRef -> IO ()
 testFillIdempotent ref =
   let fdf = makeFillFDF Field { name = "TextField1", content = FieldValue "World" }
-  in case fillPDF fdf simplePDF of
-       Left err     -> modifyIORef ref (("fillPDF (first): " <> err) :)
-       Right filled1 ->
-         case fillPDF fdf filled1 of
-           Left err      -> modifyIORef ref (("fillPDF (second): " <> err) :)
-           Right filled2 ->
-             assertM ref "fillPDF should be idempotent (same bytes on second call)" $
-               filled1 == filled2
+  in case parsePDF simplePDF of
+       Left err     -> modifyIORef ref (("parsePDF (first): " <> err) :)
+       Right pdf    ->
+         case fillPDF fdf pdf of
+           Left err     -> modifyIORef ref (("fillPDF (first): " <> err) :)
+           Right filled1 ->
+             case fillPDF fdf filled1 of
+               Left err      -> modifyIORef ref (("fillPDF (second): " <> err) :)
+               Right filled2 ->
+                 assertM ref "fillPDF should be idempotent (same bytes on second call)" $
+                   serializePDF filled1 == serializePDF filled2
 
 -- ---------------------------------------------------------------------------
 -- Main

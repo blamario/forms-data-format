@@ -9,8 +9,7 @@
 -- * §7.3 – Objects (booleans, numbers, strings, names, arrays, dictionaries)
 
 module Text.FDF.PDF.Parse (
-  parseDict, parseIndirectObject, parseValue,
-  hexDigit, dropLineEnd, dropWS, dropWS1, readDecimal
+  parseDict, parseIndirectObject, parseValue, dropWS, isPDFWS, hexDigit, readDecimal
 ) where
 
 import Control.Applicative ((<|>), empty, many, optional)
@@ -63,16 +62,11 @@ type ParseResult a = Either String (a, ByteString)
 
 -- | Parse the indirect object (@N G obj ... endobj@) at the given offset.
 parseIndirectObject :: ByteString -> Int64 -> Either String PDFValue
-parseIndirectObject bs off = do
-  let chunk = dropWS (BS.drop (fromIntegral off) bs)
-  -- Skip "N G obj"
-  let (_, r1) = BSC.span isDigit chunk           -- skip obj number
-      (_, r2) = BSC.span isDigit (dropWS r1)     -- skip generation
-      r3      = dropWS r2
-  after <- case BSC.stripPrefix "obj" r3 of
-    Just r  -> Right (dropWS r)
-    Nothing -> Left ("Expected 'obj' at offset " <> show off)
-  fst <$> parseValue after
+parseIndirectObject bs off = fmap fst $ (`runParser` BS.drop (fromIntegral off) bs) $
+  skipWS *> takeCharsWhile isDigit           -- skip obj number
+  *> skipWS *> takeCharsWhile isDigit        -- skip generation
+  *> skipWS *> string "obj"
+  *> skipWS *> pdfValue
 
 -- | Parse any PDF value, skipping leading whitespace.
 parseValue :: ByteString -> ParseResult PDFValue
@@ -252,27 +246,11 @@ pdfNum = do
            Nothing     -> empty
 
 -- ---------------------------------------------------------------------------
--- Whitespace / utility helpers
+-- utility helpers
 
 -- | Drop PDF whitespace (space, tab, CR, LF, FF, NUL) from the front.
 dropWS :: ByteString -> ByteString
 dropWS = BSC.dropWhile isPDFWS
-
--- | Drop exactly one PDF whitespace character, or nothing.
-dropWS1 :: ByteString -> ByteString
-dropWS1 bs = case BSC.uncons bs of
-  Just (c, r) | isPDFWS c -> r
-  _                        -> bs
-
--- | Drop a line ending (CR, LF, or CRLF) from the front.
-dropLineEnd :: ByteString -> ByteString
-dropLineEnd bs = case BSC.uncons bs of
-  Just (' ',  r) -> dropLineEnd r
-  Just ('\r', r) -> case BSC.uncons r of
-                      Just ('\n', r') -> r'
-                      _               -> r
-  Just ('\n', r) -> r
-  _              -> bs
 
 -- | Read a non-negative decimal integer from a 'ByteString', failing with
 -- an error if the input does not start with at least one digit.

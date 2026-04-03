@@ -20,7 +20,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 
 import Text.FDF.PDF.Decompress (decompressStream)
-import Text.FDF.PDF.Parse (dropLineEnd, dropWS, dropWS1, parseDict, readDecimal)
+import Text.FDF.PDF.Parse (dropWS, isPDFWS, parseDict, readDecimal)
 import Text.FDF.PDF.Types
 
 -- | Parse the full chain of cross-reference tables, following @/Prev@ and
@@ -225,3 +225,18 @@ parseXRefStreamEntries w1 w2 w3 subsections streamBytes =
 -- | Read @n@ bytes as a big-endian unsigned integer.
 readBEBytes :: Int -> ByteString -> Int
 readBEBytes n bs = BS.foldl' (\acc b -> acc * 256 + fromIntegral b) 0 (BS.take n bs)
+
+-- | Drop exactly one PDF whitespace character, or nothing.
+dropWS1 :: ByteString -> ByteString
+dropWS1 bs = case BSC.uncons bs of
+  Just (c, r) | isPDFWS c -> r
+  _                       -> bs
+
+-- | Drop a line ending (CR, LF, or CRLF) from the front.
+dropLineEnd :: ByteString -> ByteString
+dropLineEnd bs = case BSC.uncons bs of
+  Just (' ',  r) -> dropLineEnd r
+  Just ('\r', r) -> case BSC.uncons r of
+                      Just ('\n', r') -> r'
+                      _               -> r
+  Just ('\n', r) -> r

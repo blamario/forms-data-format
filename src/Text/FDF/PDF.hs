@@ -64,7 +64,10 @@ parsePDF bs = do
   (_, xref, _trailer, dec, _enc, fieldsArr) <- loadAcroFormFields bs
   fields <- catMaybes <$> mapM (loadFieldObj bs xref dec) fieldsArr
   fdf <- case fields of
-    []  -> Left "PDF has no AcroForm fields"
+    []  -> Right $ FDF
+             "1 0 obj\n"
+             Field { name = "", content = Children [] }
+             "endobj\ntrailer\n\n<<\n/Root 1 0 R\n>>\n"
     [f] -> Right $ FDF
              "1 0 obj\n"
              f

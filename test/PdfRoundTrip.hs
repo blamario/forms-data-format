@@ -274,12 +274,14 @@ testFillIdempotent ref =
                  assertM ref "fillPDF should be idempotent (same bytes on second call)" $
                    serializePDF filled1 == serializePDF filled2
 
--- | Parsing a PDF with no form fields should return a 'Left' error.
+-- | Parsing a PDF with no form fields should succeed with an empty form.
 testParseNoFields :: FailRef -> IO ()
 testParseNoFields ref =
   case parsePDF noFieldsPDF of
-    Left _  -> return ()  -- expected: no AcroForm fields
-    Right _ -> modifyIORef ref ("parsePDF noFieldsPDF: expected Left, got Right" :)
+    Left err  -> modifyIORef ref (("parsePDF noFieldsPDF: " <> err) :)
+    Right pdf ->
+      assertM ref "noFieldsPDF: form body should be Children []" $
+        formContent pdf == Children []
 
 -- ---------------------------------------------------------------------------
 -- Main

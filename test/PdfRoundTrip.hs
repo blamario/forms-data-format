@@ -86,6 +86,15 @@ radioPDF = makePDF
   , "<< /Type /Annot /Subtype /Widget /FT /Tx /T (TextField1) /V (InitVal) /Rect [100 650 400 670] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>"
   ]
 
+-- | A minimal PDF with an AcroForm that has an empty @\/Fields@ array
+-- (i.e. no form fields at all).
+noFieldsPDF :: BS.ByteString
+noFieldsPDF = makePDF
+  [ "<< /Type /Catalog /Pages 2 0 R /AcroForm 3 0 R >>"
+  , "<< /Type /Pages /Kids [] /Count 0 >>"
+  , "<< /Fields [] >>"
+  ]
+
 -- ---------------------------------------------------------------------------
 -- Test runner
 
@@ -265,6 +274,13 @@ testFillIdempotent ref =
                  assertM ref "fillPDF should be idempotent (same bytes on second call)" $
                    serializePDF filled1 == serializePDF filled2
 
+-- | Parsing a PDF with no form fields should return a 'Left' error.
+testParseNoFields :: FailRef -> IO ()
+testParseNoFields ref =
+  case parsePDF noFieldsPDF of
+    Left _  -> return ()  -- expected: no AcroForm fields
+    Right _ -> modifyIORef ref ("parsePDF noFieldsPDF: expected Left, got Right" :)
+
 -- ---------------------------------------------------------------------------
 -- Main
 
@@ -274,6 +290,7 @@ main = do
   let run name t = runTest failRef name (t failRef)
   run "parse simple text field PDF"          testParseSimple
   run "parse radio button PDF"               testParseRadio
+  run "parse PDF with no form fields"        testParseNoFields
   run "fill simple text field"               testFillSimple
   run "fill radio PDF (text field only)"     testFillRadio
   run "empty-name /V / survives round-trip"  testEmptyNameRoundTrip

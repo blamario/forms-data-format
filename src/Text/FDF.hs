@@ -212,6 +212,12 @@ serializeValue t
 -- | Escape raw bytes that would break a PDF literal string @(...)@.
 -- Used for the UTF-16BE branch of 'serializeValue' where the byte stream
 -- may contain @(@, @)@, or @\\@ as part of multi-byte code units.
+--
+-- The escaping is at the byte level, matching the PDF spec (§7.3.4.2):
+-- readers un-escape first, then interpret the resulting bytes as UTF-16BE.
+-- Since all escaped bytes are in the ASCII range (< 0x80), they can never
+-- appear as UTF-8 continuation bytes and are always single-byte
+-- 'ByteStringUTF8' factors, so the parser correctly un-escapes them.
 escapeRawBytes :: ByteString -> ByteString
 escapeRawBytes = ByteString.concatMap $ \b -> case b of
   0x0A -> "\\n"

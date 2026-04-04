@@ -215,6 +215,34 @@ testFloatRectRoundTrip ref =
              assertM ref "FloatField value should be 'OK'" $
                content (body fdf2) == FieldValue "OK"
 
+-- | A minimal PDF whose text field value contains raw non-ASCII bytes that
+-- are NOT valid UTF-8.  Before the fix, the @ByteStringUTF8@-based parser's
+-- 'takeCharsWhile1' would stop at these bytes because they have no character
+-- representation, causing the parse to fail.
+binaryStringPDF :: BS.ByteString
+binaryStringPDF = makePDF
+  [ "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>"
+  , "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>"
+  , "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [ 6 0 R ] >>"
+  , "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+  , "<< /Fields [ 6 0 R ] /DR << /Font << /Helv 4 0 R >> >> >>"
+  -- /V contains raw bytes 0x80, 0xFE which are invalid UTF-8
+  , "<< /Type /Annot /Subtype /Widget /FT /Tx /T (BinField) /V (A\x80\xfeZ) /Rect [100 700 400 720] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>"
+  ]
+
+-- | Parsing a PDF whose literal string field contains raw non-ASCII bytes
+-- (invalid UTF-8) should succeed.  This is a regression test for the
+-- 'takeCharsWhile1' → 'takeWhile1' fix in 'pdfLiteralContent'.
+testBinaryStringParse :: FailRef -> IO ()
+testBinaryStringParse ref =
+  case parsePDF binaryStringPDF of
+    Left err  -> modifyIORef ref (("parsePDF binaryStringPDF: " <> err) :)
+    Right fdf -> do
+      assertM ref "binaryStringPDF: field name should be BinField" $
+        name (body fdf) == "BinField"
+      assertM ref "binaryStringPDF: field value should contain raw bytes" $
+        content (body fdf) == FieldValue "A\x80\xfeZ"
+
 -- | fillPDF should be idempotent: applying the same FDF twice produces the
 -- same byte output as applying it once.
 testFillIdempotent :: FailRef -> IO ()
@@ -242,6 +270,7 @@ main = do
   run "fill radio PDF (text field only)"     testFillRadio
   run "empty-name /V / survives round-trip"  testEmptyNameRoundTrip
   run "float /Rect coords survive round-trip" testFloatRectRoundTrip
+  run "binary bytes in literal string"        testBinaryStringParse
   run "fillPDF is idempotent"                testFillIdempotent
   failures <- readIORef failRef
   if null failures

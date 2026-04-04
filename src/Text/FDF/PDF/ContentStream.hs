@@ -24,6 +24,7 @@ import qualified Data.ByteString.Char8 as BSC
 import Data.Char (isDigit, isSpace)
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
+import Data.Text.Encoding.Error (lenientDecode)
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -169,7 +170,7 @@ mkFrag ts raw = TextFragment
 -- present, otherwise falls back to Latin-1 (PDFDocEncoding).
 decodePDFTextBytes :: ByteString -> Text
 decodePDFTextBytes bs
-  | "\xFE\xFF" `BS.isPrefixOf` bs = Text.decodeUtf16BE (BS.drop 2 bs)
+  | "\xFE\xFF" `BS.isPrefixOf` bs = Text.decodeUtf16BEWith lenientDecode (BS.drop 2 bs)
   | otherwise                      = Text.decodeLatin1 bs
 
 -- ---------------------------------------------------------------------------

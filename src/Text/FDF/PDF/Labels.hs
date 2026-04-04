@@ -18,6 +18,7 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
+import Data.Text.Encoding.Error (lenientDecode)
 
 import Text.FDF (Field (..), FieldContent (..))
 import Text.FDF.PDF.ContentStream (TextFragment (..), extractTextFragments)
@@ -226,7 +227,7 @@ decodeFieldText dict key =
 -- | Decode a raw PDF string to 'Text'.
 decodePDFString :: ByteString -> Text
 decodePDFString bs
-  | "\xFE\xFF" `BS.isPrefixOf` bs = Text.decodeUtf16BE (BS.drop 2 bs)
+  | "\xFE\xFF" `BS.isPrefixOf` bs = Text.decodeUtf16BEWith lenientDecode (BS.drop 2 bs)
   | otherwise                      = Text.decodeLatin1 bs
 
 -- | Convert a 'PDFValue' to 'Double'.

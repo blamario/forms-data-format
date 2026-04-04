@@ -35,6 +35,7 @@ import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
+import Data.Text.Encoding.Error (lenientDecode)
 
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
 import Text.FDF.PDF.Decompress (decompressStream)
@@ -347,7 +348,7 @@ decodeFieldText dict key =
 -- Latin-1 (PDFDocEncoding) is assumed.
 decodePDFString :: ByteString -> Text
 decodePDFString bs
-  | "\xFE\xFF" `BS.isPrefixOf` bs = Text.decodeUtf16BE (BS.drop 2 bs)
+  | "\xFE\xFF" `BS.isPrefixOf` bs = Text.decodeUtf16BEWith lenientDecode (BS.drop 2 bs)
   | otherwise                      = Text.decodeLatin1 bs
 
 -- ---------------------------------------------------------------------------

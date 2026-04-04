@@ -270,11 +270,11 @@ testBinaryStringParse :: FailRef -> IO ()
 testBinaryStringParse ref =
   case parsePDF binaryStringPDF of
     Left err  -> modifyIORef ref (("parsePDF binaryStringPDF: " <> err) :)
-    Right fdf -> do
+    Right pdf -> do
       assertM ref "binaryStringPDF: field name should be BinField" $
-        name (body fdf) == "BinField"
+        name (body $ form pdf) == "BinField"
       assertM ref "binaryStringPDF: field value should contain raw bytes" $
-        content (body fdf) == FieldValue "A\x80\xfeZ"
+        content (body $ form pdf) == FieldValue "A\x80\xfeZ"
 
 -- | fillPDF should be idempotent: applying the same FDF twice produces the
 -- same byte output as applying it once.

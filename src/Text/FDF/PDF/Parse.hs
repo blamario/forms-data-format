@@ -29,7 +29,7 @@ import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
 import Data.Scientific (Scientific, toRealFloat)
 import Data.Word (Word8)
 import Rank2 qualified
-import Text.Grampa (InputParsing (string, anyToken, takeWhile1), InputCharParsing (..),
+import Text.Grampa (InputParsing (string, anyToken, satisfy), InputCharParsing (..),
                     ParseFailure (..), FailureDescription (..))
 import Text.Grampa.Combinators (concatMany, moptional, upto)
 import Text.Grampa.PEG.Backtrack qualified as PEG
@@ -134,16 +134,23 @@ pdfLiteralContent = concatMany litChunk
     litChunk =
           litEscape
       <|> litNested
-      -- Use factor-level 'takeWhile1' (not character-level 'takeCharsWhile1')
-      -- so that raw non-ASCII bytes that are not valid UTF-8 are still consumed.
-      -- PDF literal strings can contain arbitrary binary data.
-      <|> takeWhile1 isRegularLitFactor
+      -- Consume a run of valid UTF-8 characters that are not delimiters.
+      <|> takeCharsWhile1 isRegularLitChar
+      -- Fall back to consuming a single non-character factor (invalid or
+      -- incomplete UTF-8 byte sequence).  PDF literal strings can contain
+      -- arbitrary binary data, so we must handle bytes that do not form
+      -- valid characters.  Non-character factors always have their first
+      -- byte >= 0x80, so they can never be a delimiter.
+      <|> satisfy isNonCharFactor
     -- A nested pair @(...)@ is kept verbatim in the string value.
     litNested = string "(" <> pdfLiteralContent <> string ")"
-    -- Any factor (byte or multi-byte UTF-8 character) other than @(@, @)@,
-    -- or @\@ is regular literal content.  Multi-byte UTF-8 characters always
-    -- pass because they can never equal a single-byte ASCII delimiter.
-    isRegularLitFactor (ByteStringUTF8 b) = b /= "(" && b /= ")" && b /= "\\"
+    -- Any character except @(@, @)@, or @\@ is a regular literal character.
+    isRegularLitChar c = c /= '(' && c /= ')' && c /= '\\'
+    -- A non-character factor is a ByteStringUTF8 whose first byte is >= 0x80
+    -- but does not form a valid UTF-8 character.  Since takeCharsWhile1 above
+    -- already consumed all valid characters, this only matches invalid byte
+    -- sequences.
+    isNonCharFactor (ByteStringUTF8 b) = not (BS.null b) && BS.head b >= 0x80
 
 -- | Parse a backslash escape sequence inside a literal string.
 litEscape :: PDFParser ByteStringUTF8

@@ -29,7 +29,7 @@ import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
 import Data.Scientific (Scientific, toRealFloat)
 import Data.Word (Word8)
 import Rank2 qualified
-import Text.Grampa (InputParsing (string, anyToken), InputCharParsing (..),
+import Text.Grampa (InputParsing (string, anyToken, takeWhile1), InputCharParsing (..),
                     ParseFailure (..), FailureDescription (..))
 import Text.Grampa.Combinators (concatMany, moptional, upto)
 import Text.Grampa.PEG.Backtrack qualified as PEG
@@ -134,11 +134,16 @@ pdfLiteralContent = concatMany litChunk
     litChunk =
           litEscape
       <|> litNested
-      <|> takeCharsWhile1 isRegularLitChar
+      -- Use factor-level 'takeWhile1' (not character-level 'takeCharsWhile1')
+      -- so that raw non-ASCII bytes that are not valid UTF-8 are still consumed.
+      -- PDF literal strings can contain arbitrary binary data.
+      <|> takeWhile1 isRegularLitFactor
     -- A nested pair @(...)@ is kept verbatim in the string value.
     litNested = string "(" <> pdfLiteralContent <> string ")"
-    -- Any character except @(@, @)@, or @\@ is a regular literal character.
-    isRegularLitChar c = c /= '(' && c /= ')' && c /= '\\'
+    -- Any factor (byte or multi-byte UTF-8 character) other than @(@, @)@,
+    -- or @\@ is regular literal content.  Multi-byte UTF-8 characters always
+    -- pass because they can never equal a single-byte ASCII delimiter.
+    isRegularLitFactor (ByteStringUTF8 b) = b /= "(" && b /= ")" && b /= "\\"
 
 -- | Parse a backslash escape sequence inside a literal string.
 litEscape :: PDFParser ByteStringUTF8

@@ -24,7 +24,6 @@ import qualified Data.ByteString.Char8 as BSC
 import Data.Char (isDigit, isSpace)
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
-import Data.Text.Encoding.Error (lenientDecode)
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -166,12 +165,13 @@ mkFrag ts raw = TextFragment
   , fragmentSize = tsSize ts
   }
 
--- | Decode raw PDF string bytes to 'Text'.  Tries UTF-16BE if the BOM is
--- present, otherwise falls back to Latin-1 (PDFDocEncoding).
+-- | Decode raw content-stream text bytes to 'Text'.
+-- Content-stream text operands are font-encoded bytes, not PDF string objects,
+-- so the UTF-16BE BOM convention does not apply.  We always decode as Latin-1
+-- (the closest single-byte approximation when no font encoding info is
+-- available).
 decodePDFTextBytes :: ByteString -> Text
-decodePDFTextBytes bs
-  | "\xFE\xFF" `BS.isPrefixOf` bs = Text.decodeUtf16BEWith lenientDecode (BS.drop 2 bs)
-  | otherwise                      = Text.decodeLatin1 bs
+decodePDFTextBytes = Text.decodeLatin1
 
 -- ---------------------------------------------------------------------------
 -- Tokeniser

@@ -195,7 +195,7 @@ serializeField Field{name, content = Children kids} =
 serializeValue :: Text -> ByteString
 serializeValue t
   | Text.isAscii t = encodeUtf8 (plain <> escaped)
-  | otherwise = utf16beBOM <> encodeUtf16BE t
+  | otherwise = escapeRawBytes (utf16beBOM <> encodeUtf16BE t)
   where (plain, special) = Text.span (\c -> c >= ' ' && c `notElem` ['(', ')', '\\']) t
         escaped = Text.concatMap escape special
         escape '(' = Text.pack "\\("
@@ -208,6 +208,18 @@ serializeValue t
         escape c
           | c < ' ' = "\\" <> Text.justifyRight 3 '0' (Text.pack $ showOct (ord c) "")
           | otherwise = Text.singleton c
+
+-- | Escape raw bytes that would break a PDF literal string @(...)@.
+-- Used for the UTF-16BE branch of 'serializeValue' where the byte stream
+-- may contain @(@, @)@, or @\\@ as part of multi-byte code units.
+escapeRawBytes :: ByteString -> ByteString
+escapeRawBytes = ByteString.concatMap $ \b -> case b of
+  0x0A -> "\\n"
+  0x0D -> "\\r"
+  0x28 -> "\\("
+  0x29 -> "\\)"
+  0x5C -> "\\\\"
+  _    -> ByteString.singleton b
 
 parse :: ByteString -> Either String FDF
 parse input =
@@ -241,7 +253,8 @@ field = Field <$ begin
   where
     fieldStringValue = strictText $
                  admit (string "/V ("
-                        *> commit ((string (ByteStringUTF8 utf16beBOM) *> (utf8from16 <$> Text.Grampa.takeWhile (/= ")"))
+                        *> commit ((string (ByteStringUTF8 utf16beBOM)
+                                     *> (utf8from16 <$> concatMany (takeWhile1 (\b -> b `notElem` [")", "\\", "\n", "\r"]) <|> escape))
                                     <|> concatMany (takeCharsWhile1 (`notElem` [')', '\r', '\n', '\\']) <|> escape))
                                    <* string ")" <* lineEnd)
                         <?> "string value")

@@ -10,6 +10,7 @@ import Data.List (foldl')
 import System.Exit (exitFailure, exitSuccess)
 
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
+import qualified Text.FDF as FDF
 import Text.FDF.PDF (PDF (..), parsePDF, fillPDF, serializePDF, fieldLabels)
 
 -- ---------------------------------------------------------------------------
@@ -348,6 +349,22 @@ testFieldLabelsNoFields ref =
           assertM ref "fieldLabels: empty list for no-field PDF" $
             null fields
 
+-- | FDF round-trip for non-ASCII values containing @)@.  Before the
+-- 'escapeRawBytes' fix, @serializeValue@ would produce UTF-16BE bytes
+-- containing a bare @0x29@ byte (the `)` encoding), which the parser would
+-- mistake for the string terminator, resulting in "Invalid UTF-16BE stream".
+testFdfUtf16RoundTrip :: FailRef -> IO ()
+testFdfUtf16RoundTrip ref =
+  let val = "caf\233 (aide)"  -- non-ASCII é plus parentheses
+      fdf = makeFillFDF Field { name = "T", content = FieldValue val }
+      fdfBytes = FDF.serialize fdf
+  in case FDF.parse fdfBytes of
+       Left err ->
+         modifyIORef ref (("FDF utf16 round-trip parse failed: " <> err) :)
+       Right fdf' ->
+         assertM ref "FDF utf16 round-trip: value should survive" $
+           content (body fdf') == FieldValue val
+
 -- ---------------------------------------------------------------------------
 -- Main
 
@@ -367,6 +384,7 @@ main = do
   run "fillPDF is idempotent"                testFillIdempotent
   run "fieldLabels maps text to fields"      testFieldLabels
   run "fieldLabels on no-field PDF"          testFieldLabelsNoFields
+  run "FDF UTF-16BE round-trip with parens"  testFdfUtf16RoundTrip
   failures <- readIORef failRef
   if null failures
     then do

@@ -22,6 +22,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.Char (isDigit, isSpace)
+import Data.List (mapAccumL)
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
 
@@ -69,93 +70,98 @@ defaultTS = TextState 0 0 12 0
 -- in the stream are not fatal — the function returns whatever fragments it
 -- managed to extract.
 extractTextFragments :: ByteString -> [TextFragment]
-extractTextFragments = runStream defaultTS [] . dropCSWS
+extractTextFragments = concat . snd . mapAccumL step (defaultTS, []) . tokenize
+
+-- | Tokenize a content stream into a list of 'Token's.
+tokenize :: ByteString -> [Token]
+tokenize = go . dropCSWS
+  where
+    go bs = case nextToken bs of
+      Nothing          -> []
+      Just (tok, rest) -> tok : go rest
 
 -- ---------------------------------------------------------------------------
 -- Stream interpreter
 
-runStream :: TextState -> [Operand] -> ByteString -> [TextFragment]
-runStream _  _    bs | BS.null bs = []
-runStream ts stk  bs =
-  case nextToken bs of
-    Nothing -> []
-    Just (TokOperator op, rest) -> handleOp ts stk op rest
-    Just (TokOperand  v,  rest) -> runStream ts (stk ++ [v]) rest
-    Just (TokSkip,        rest) -> runStream ts stk rest
+-- | Process one token, threading @(TextState, [Operand])@ as accumulator.
+-- The operand stack is kept in reverse order (last pushed operand at head).
+step :: (TextState, [Operand]) -> Token -> ((TextState, [Operand]), [TextFragment])
+step (ts, stk) (TokOperand v)    = ((ts, v : stk), [])
+step (ts, stk) (TokOperator op)  = let (ts', frags) = handleOp ts stk op
+                                    in ((ts', []), frags)
+step (ts, stk) TokSkip           = ((ts, stk), [])
 
-handleOp :: TextState -> [Operand] -> ByteString -> ByteString -> [TextFragment]
-handleOp ts _stk "BT" rest =
+-- | Interpret one operator, consuming the operand stack (in reverse order)
+-- and returning the updated 'TextState' plus any emitted 'TextFragment's.
+handleOp :: TextState -> [Operand] -> ByteString -> (TextState, [TextFragment])
+handleOp ts _stk "BT" =
   -- Begin text object: reset operand stack, keep text state
-  runStream ts [] rest
-handleOp ts _stk "ET" rest =
+  (ts, [])
+handleOp ts _stk "ET" =
   -- End text object
-  runStream ts [] rest
-handleOp ts stk "Tf" rest =
+  (ts, [])
+handleOp ts stk "Tf" =
   -- /FontName fontSize Tf
   let sz = case stk of
-             [_, OpNum s] -> s
+             [OpNum s, _] -> s
              _            -> tsSize ts
-  in runStream ts { tsSize = sz } [] rest
-handleOp ts stk "TL" rest =
+  in (ts { tsSize = sz }, [])
+handleOp ts stk "TL" =
   -- leading TL
   let ld = case stk of
              [OpNum l] -> l
              _         -> tsLead ts
-  in runStream ts { tsLead = ld } [] rest
-handleOp ts stk "Tm" rest =
+  in (ts { tsLead = ld }, [])
+handleOp ts stk "Tm" =
   -- a b c d e f Tm — set text matrix
   let (x, y) = case stk of
-                 [_, _, _, _, OpNum e, OpNum f] -> (e, f)
+                 [OpNum f, OpNum e, _, _, _, _] -> (e, f)
                  _                              -> (tsX ts, tsY ts)
-  in runStream ts { tsX = x, tsY = y } [] rest
-handleOp ts stk "Td" rest =
+  in (ts { tsX = x, tsY = y }, [])
+handleOp ts stk "Td" =
   -- tx ty Td — relative move
   let (tx, ty) = case stk of
-                   [OpNum x, OpNum y] -> (x, y)
+                   [OpNum y, OpNum x] -> (x, y)
                    _                  -> (0, 0)
-  in runStream ts { tsX = tsX ts + tx, tsY = tsY ts + ty } [] rest
-handleOp ts stk "TD" rest =
+  in (ts { tsX = tsX ts + tx, tsY = tsY ts + ty }, [])
+handleOp ts stk "TD" =
   -- tx ty TD — like Td but also sets TL = -ty
   let (tx, ty) = case stk of
-                   [OpNum x, OpNum y] -> (x, y)
+                   [OpNum y, OpNum x] -> (x, y)
                    _                  -> (0, 0)
-  in runStream ts { tsX = tsX ts + tx, tsY = tsY ts + ty, tsLead = negate ty } [] rest
-handleOp ts _stk "T*" rest =
+  in (ts { tsX = tsX ts + tx, tsY = tsY ts + ty, tsLead = negate ty }, [])
+handleOp ts _stk "T*" =
   -- Move to start of next line (0 -TL Td)
-  runStream ts { tsY = tsY ts - tsLead ts } [] rest
-handleOp ts stk "Tj" rest =
+  (ts { tsY = tsY ts - tsLead ts }, [])
+handleOp ts stk "Tj" =
   -- (string) Tj — show text
-  let frag = case stk of
-               [OpStr s] -> [mkFrag ts s]
-               _         -> []
-  in frag ++ runStream ts [] rest
-handleOp ts stk "TJ" rest =
+  case stk of
+    [OpStr s] -> (ts, [mkFrag ts s])
+    _         -> (ts, [])
+handleOp ts stk "TJ" =
   -- [ (str) kern ... ] TJ — show text with kerning
-  let frags = case stk of
-                [OpArray elems] ->
-                  let strs = [s | OpStr s <- elems]
-                  in case strs of
-                       [] -> []
-                       _  -> [mkFrag ts (BS.concat strs)]
-                _ -> []
-  in frags ++ runStream ts [] rest
-handleOp ts stk "'" rest =
+  case stk of
+    [OpArray elems] ->
+      let strs = [s | OpStr s <- elems]
+      in case strs of
+           [] -> (ts, [])
+           _  -> (ts, [mkFrag ts (BS.concat strs)])
+    _ -> (ts, [])
+handleOp ts stk "'" =
   -- (string) ' — T* then Tj
   let ts' = ts { tsY = tsY ts - tsLead ts }
-      frag = case stk of
-               [OpStr s] -> [mkFrag ts' s]
-               _         -> []
-  in frag ++ runStream ts' [] rest
-handleOp ts stk "\"" rest =
+  in case stk of
+       [OpStr s] -> (ts', [mkFrag ts' s])
+       _         -> (ts', [])
+handleOp ts stk "\"" =
   -- aw ac (string) " — set word/char spacing, T*, Tj
   let ts' = ts { tsY = tsY ts - tsLead ts }
-      frag = case stk of
-               [_, _, OpStr s] -> [mkFrag ts' s]
-               _               -> []
-  in frag ++ runStream ts' [] rest
-handleOp ts _stk _ rest =
+  in case stk of
+       [OpStr s, _, _] -> (ts', [mkFrag ts' s])
+       _               -> (ts', [])
+handleOp ts _stk _ =
   -- Unknown operator: discard operand stack
-  runStream ts [] rest
+  (ts, [])
 
 mkFrag :: TextState -> ByteString -> TextFragment
 mkFrag ts raw = TextFragment

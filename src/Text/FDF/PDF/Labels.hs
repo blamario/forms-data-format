@@ -42,10 +42,21 @@ type ObjLoader = PDFValue -> Either String PDFValue
 type PageStreamLoader = Int -> Either String ByteString
 
 -- ---------------------------------------------------------------------------
--- Public API
+-- Rectangle type
 
--- | A field bounding rectangle: (page object number, llx, lly, urx, ury).
-type FieldRect = (Int, Double, Double, Double, Double)
+-- | A PDF bounding rectangle with lower-left and upper-right corners.
+data Rect = Rect
+  { rectLLX :: !Double   -- ^ lower-left X
+  , rectLLY :: !Double   -- ^ lower-left Y
+  , rectURX :: !Double   -- ^ upper-right X
+  , rectURY :: !Double   -- ^ upper-right Y
+  } deriving (Eq, Ord, Show)
+
+-- | A field bounding rectangle: page object number paired with the rect.
+type FieldRect = (Int, Rect)
+
+-- ---------------------------------------------------------------------------
+-- Public API
 
 -- | Build a list of 'Field's mirroring the AcroForm hierarchy where each
 -- leaf field's value is the nearby page text (its label).  The hierarchy is
@@ -190,12 +201,12 @@ pageFromDict dict =
     _                  -> Right []
 
 -- | Extract the @\/Rect@ and @\/P@ from a dictionary, if both are present.
-extractRectAndPage :: Map ByteString PDFValue -> Maybe (Int, Double, Double, Double, Double)
+extractRectAndPage :: Map ByteString PDFValue -> Maybe FieldRect
 extractRectAndPage dict =
   case (Map.lookup "Rect" dict, Map.lookup "P" dict) of
     (Just (PDFArray [a, b, c, d]), Just (PDFRef pn _)) ->
       case (toDouble a, toDouble b, toDouble c, toDouble d) of
-        (Just llx, Just lly, Just urx, Just ury) -> Just (pn, llx, lly, urx, ury)
+        (Just llx, Just lly, Just urx, Just ury) -> Just (pn, Rect llx lly urx ury)
         _                                        -> Nothing
     _ -> Nothing
 
@@ -224,7 +235,7 @@ collectLeafRectFromDict loadObj dict =
       named <- anyHasFieldName loadObj kids
       if named
         then collectLeafRects loadObj kids
-        else Right (maybeToList (extractRectAndPage dict))
+        else Right ownRect
     Just kidRef@PDFRef{} -> do
       kidsVal <- loadObj kidRef
       case kidsVal of
@@ -232,9 +243,10 @@ collectLeafRectFromDict loadObj dict =
           named <- anyHasFieldName loadObj kids
           if named
             then collectLeafRects loadObj kids
-            else Right (maybeToList (extractRectAndPage dict))
-        _ -> Right (maybeToList (extractRectAndPage dict))
-    _ -> Right (maybeToList (extractRectAndPage dict))
+            else Right ownRect
+        _ -> Right ownRect
+    _ -> Right ownRect
+  where ownRect = maybeToList (extractRectAndPage dict)
 
 -- | Check whether any of the given field references is a named field
 -- (has a @\/T@ entry), as opposed to an anonymous widget annotation.
@@ -255,14 +267,14 @@ anyHasFieldName loadObj = fmap or . mapM check
 -- from causing the same label to appear under multiple fields.
 assignExclusively :: Map Int [TextFragment] -> [FieldRect] -> Map FieldRect [Text]
 assignExclusively pageTextMap allRects =
-  let rectsByPage :: Map Int [(Double, Double, Double, Double)]
+  let rectsByPage :: Map Int [Rect]
       rectsByPage = Map.fromListWith (++)
-        [(p, [(llx, lly, urx, ury)]) | (p, llx, lly, urx, ury) <- allRects]
+        [(p, [r]) | (p, r) <- allRects]
       assignPage pageNum frags =
-        [ ((pageNum, rllx, rlly, rurx, rury), fragmentText f)
+        [ ((pageNum, nr), fragmentText f)
         | f <- frags
         , not (Text.null (Text.strip (fragmentText f)))
-        , (rllx, rlly, rurx, rury) <- maybeToList
+        , nr <- maybeToList
             (nearestRect (fromMaybe [] (Map.lookup pageNum rectsByPage)) f)
         ]
       allAssignments = concatMap
@@ -274,10 +286,7 @@ assignExclusively pageTextMap allRects =
 -- | Find the nearest field rectangle to a text fragment, considering only
 -- rectangles within the proximity margin.  Returns 'Nothing' if no
 -- rectangle is close enough.
-nearestRect
-  :: [(Double, Double, Double, Double)]
-  -> TextFragment
-  -> Maybe (Double, Double, Double, Double)
+nearestRect :: [Rect] -> TextFragment -> Maybe Rect
 nearestRect rects tf =
   case [(r, rectDist r tf) | r <- rects, isNearbyRect r tf] of
     []         -> Nothing
@@ -285,13 +294,13 @@ nearestRect rects tf =
 
 -- | Check whether a text fragment is within the proximity margin of a
 -- rectangle.
-isNearbyRect :: (Double, Double, Double, Double) -> TextFragment -> Bool
-isNearbyRect (llx, lly, urx, ury) = isNearby llx lly urx ury
+isNearbyRect :: Rect -> TextFragment -> Bool
+isNearbyRect (Rect llx lly urx ury) = isNearby llx lly urx ury
 
 -- | Squared distance from a text fragment's position to the nearest edge
 -- of a rectangle.  Returns 0 when the point lies inside the rectangle.
-rectDist :: (Double, Double, Double, Double) -> TextFragment -> Double
-rectDist (llx, lly, urx, ury) tf =
+rectDist :: Rect -> TextFragment -> Double
+rectDist (Rect llx lly urx ury) tf =
   let tx = fragmentX tf
       ty = fragmentY tf
       dx = max 0 (max (llx - tx) (tx - urx))

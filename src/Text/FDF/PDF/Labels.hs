@@ -5,6 +5,10 @@
 --
 -- This module contains the low-level machinery for 'Text.FDF.PDF.fieldLabels':
 -- field bounding-box collection, page text loading, and proximity matching.
+--
+-- Each text fragment is assigned to at most one field — the nearest one
+-- within the proximity margin — so that overlapping expanded bounding
+-- rectangles do not cause the same label to appear in multiple fields.
 
 module Text.FDF.PDF.Labels (
   buildFieldLabels,
@@ -12,10 +16,11 @@ module Text.FDF.PDF.Labels (
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.List (minimumBy, nub)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.List (nub)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, maybeToList)
+import Data.Ord (comparing)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
@@ -39,9 +44,16 @@ type PageStreamLoader = Int -> Either String ByteString
 -- ---------------------------------------------------------------------------
 -- Public API
 
+-- | A field bounding rectangle: (page object number, llx, lly, urx, ury).
+type FieldRect = (Int, Double, Double, Double, Double)
+
 -- | Build a list of 'Field's mirroring the AcroForm hierarchy where each
 -- leaf field's value is the nearby page text (its label).  The hierarchy is
 -- preserved: parent fields with named children produce 'Children' nodes.
+--
+-- Each text fragment is assigned to at most one field — the one whose
+-- bounding box is nearest — so overlapping proximity zones do not cause a
+-- label to appear in multiple fields.
 --
 -- Fields without a @\/Rect@ or @\/P@ (and thus without locatable labels)
 -- are included with an empty 'FieldValue'.
@@ -58,8 +70,12 @@ buildFieldLabels loadObj loadPage fieldsArr = do
   -- Load page text fragments, keyed by page object number.
   pageTexts <- mapM (\p -> (,) p <$> loadPageFragments loadPage p) pageObjNums
   let pageTextMap = Map.fromList pageTexts
+  -- Collect all leaf field bounding rectangles.
+  allRects <- collectLeafRects loadObj fieldsArr
+  -- Assign each text fragment exclusively to the nearest field.
+  let assignments = assignExclusively pageTextMap allRects
   -- Second pass: build the Field tree with labels.
-  buildLabelFields loadObj pageTextMap [] fieldsArr
+  buildLabelFields loadObj assignments [] fieldsArr
 
 -- ---------------------------------------------------------------------------
 -- Field hierarchy building
@@ -68,35 +84,35 @@ buildFieldLabels loadObj loadPage fieldsArr = do
 -- leaf values are the nearby text labels.
 buildLabelFields
   :: ObjLoader
-  -> Map Int [TextFragment]    -- ^ page object number → text fragments
+  -> Map FieldRect [Text]      -- ^ exclusive text assignments
   -> [Text]                    -- ^ path prefix (ancestor names)
   -> [PDFValue]                -- ^ field references
   -> Either String [Field]
-buildLabelFields loadObj pageTextMap prefix refs = do
-  mFields <- mapM (buildLabelField loadObj pageTextMap prefix) refs
+buildLabelFields loadObj assignments prefix refs = do
+  mFields <- mapM (buildLabelField loadObj assignments prefix) refs
   Right [f | Just f <- mFields]
 
 buildLabelField
   :: ObjLoader
-  -> Map Int [TextFragment]
+  -> Map FieldRect [Text]
   -> [Text]
   -> PDFValue
   -> Either String (Maybe Field)
-buildLabelField loadObj pageTextMap prefix ref = do
+buildLabelField loadObj assignments prefix ref = do
   obj <- loadObj ref
   case obj of
-    PDFDict dict -> buildFromDict loadObj pageTextMap prefix dict
+    PDFDict dict -> buildFromDict loadObj assignments prefix dict
     _            -> Right Nothing
 
 -- | Build a 'Field' from a field dictionary.  Returns 'Nothing' for widget
 -- annotations without a @\/T@ entry (anonymous widgets).
 buildFromDict
   :: ObjLoader
-  -> Map Int [TextFragment]
+  -> Map FieldRect [Text]
   -> [Text]
   -> Map ByteString PDFValue
   -> Either String (Maybe Field)
-buildFromDict loadObj pageTextMap prefix dict =
+buildFromDict loadObj assignments prefix dict =
   case Map.lookup "T" dict of
     Nothing -> Right Nothing   -- anonymous widget → skip
     _ -> do
@@ -104,30 +120,29 @@ buildFromDict loadObj pageTextMap prefix dict =
       let path = prefix ++ [fieldName]
       cont <- case Map.lookup "Kids" dict of
         Just (PDFArray kids) -> do
-          childFields <- buildLabelFields loadObj pageTextMap path kids
+          childFields <- buildLabelFields loadObj assignments path kids
           if null childFields
-            then leafLabel pageTextMap dict  -- all kids are widgets → leaf
+            then leafLabel assignments dict  -- all kids are widgets → leaf
             else Right (Children childFields)
         Just kidRef@PDFRef{} -> do
           kidsVal <- loadObj kidRef
           case kidsVal of
             PDFArray kids -> do
-              childFields <- buildLabelFields loadObj pageTextMap path kids
+              childFields <- buildLabelFields loadObj assignments path kids
               if null childFields
-                then leafLabel pageTextMap dict
+                then leafLabel assignments dict
                 else Right (Children childFields)
-            _ -> leafLabel pageTextMap dict
-        _ -> leafLabel pageTextMap dict
+            _ -> leafLabel assignments dict
+        _ -> leafLabel assignments dict
       Right $ Just Field { name = fieldName, content = cont }
 
 -- | Produce a leaf 'FieldContent' whose value is the concatenation of
--- nearby text fragments.
-leafLabel :: Map Int [TextFragment] -> Map ByteString PDFValue -> Either String FieldContent
-leafLabel pageTextMap dict =
+-- text fragments exclusively assigned to this field.
+leafLabel :: Map FieldRect [Text] -> Map ByteString PDFValue -> Either String FieldContent
+leafLabel assignments dict =
   case extractRectAndPage dict of
-    Just (pageNum, llx, lly, urx, ury) ->
-      let frags = fromMaybe [] (Map.lookup pageNum pageTextMap)
-          nearby = [fragmentText f | f <- frags, isNearby llx lly urx ury f]
+    Just rect ->
+      let nearby = fromMaybe [] (Map.lookup rect assignments)
       in Right $ FieldValue (Text.intercalate " " nearby)
     Nothing -> Right (FieldValue "")
 
@@ -183,6 +198,105 @@ extractRectAndPage dict =
         (Just llx, Just lly, Just urx, Just ury) -> Just (pn, llx, lly, urx, ury)
         _                                        -> Nothing
     _ -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- Leaf field rectangle collection
+
+-- | Walk the AcroForm field hierarchy and collect the bounding rectangle
+-- of every leaf field (fields that will receive a label).
+collectLeafRects :: ObjLoader -> [PDFValue] -> Either String [FieldRect]
+collectLeafRects loadObj refs = concat <$> mapM (collectLeafRect loadObj) refs
+
+collectLeafRect :: ObjLoader -> PDFValue -> Either String [FieldRect]
+collectLeafRect loadObj ref = do
+  obj <- loadObj ref
+  case obj of
+    PDFDict dict ->
+      case Map.lookup "T" dict of
+        Nothing -> Right []   -- anonymous widget
+        Just _  -> collectLeafRectFromDict loadObj dict
+    _ -> Right []
+
+collectLeafRectFromDict :: ObjLoader -> Map ByteString PDFValue -> Either String [FieldRect]
+collectLeafRectFromDict loadObj dict =
+  case Map.lookup "Kids" dict of
+    Just (PDFArray kids) -> do
+      named <- anyHasFieldName loadObj kids
+      if named
+        then collectLeafRects loadObj kids
+        else Right (maybeToList (extractRectAndPage dict))
+    Just kidRef@PDFRef{} -> do
+      kidsVal <- loadObj kidRef
+      case kidsVal of
+        PDFArray kids -> do
+          named <- anyHasFieldName loadObj kids
+          if named
+            then collectLeafRects loadObj kids
+            else Right (maybeToList (extractRectAndPage dict))
+        _ -> Right (maybeToList (extractRectAndPage dict))
+    _ -> Right (maybeToList (extractRectAndPage dict))
+
+-- | Check whether any of the given field references is a named field
+-- (has a @\/T@ entry), as opposed to an anonymous widget annotation.
+anyHasFieldName :: ObjLoader -> [PDFValue] -> Either String Bool
+anyHasFieldName loadObj = fmap or . mapM check
+  where
+    check ref = do
+      obj <- loadObj ref
+      case obj of
+        PDFDict dict -> Right (Map.member "T" dict)
+        _            -> Right False
+
+-- ---------------------------------------------------------------------------
+-- Exclusive text assignment
+
+-- | Assign each text fragment to at most one field — the one whose
+-- bounding box is nearest.  This prevents overlapping proximity zones
+-- from causing the same label to appear under multiple fields.
+assignExclusively :: Map Int [TextFragment] -> [FieldRect] -> Map FieldRect [Text]
+assignExclusively pageTextMap allRects =
+  let rectsByPage :: Map Int [(Double, Double, Double, Double)]
+      rectsByPage = Map.fromListWith (++)
+        [(p, [(llx, lly, urx, ury)]) | (p, llx, lly, urx, ury) <- allRects]
+      assignPage pageNum frags =
+        [ ((pageNum, rllx, rlly, rurx, rury), fragmentText f)
+        | f <- frags
+        , not (Text.null (Text.strip (fragmentText f)))
+        , (rllx, rlly, rurx, rury) <- maybeToList
+            (nearestRect (fromMaybe [] (Map.lookup pageNum rectsByPage)) f)
+        ]
+      allAssignments = concatMap
+        (\(pn, frags) -> assignPage pn frags)
+        (Map.toList pageTextMap)
+  in Map.fromListWith (++)
+       [(rect, [txt]) | (rect, txt) <- allAssignments]
+
+-- | Find the nearest field rectangle to a text fragment, considering only
+-- rectangles within the proximity margin.  Returns 'Nothing' if no
+-- rectangle is close enough.
+nearestRect
+  :: [(Double, Double, Double, Double)]
+  -> TextFragment
+  -> Maybe (Double, Double, Double, Double)
+nearestRect rects tf =
+  case [(r, rectDist r tf) | r <- rects, isNearbyRect r tf] of
+    []         -> Nothing
+    candidates -> Just (fst (minimumBy (comparing snd) candidates))
+
+-- | Check whether a text fragment is within the proximity margin of a
+-- rectangle.
+isNearbyRect :: (Double, Double, Double, Double) -> TextFragment -> Bool
+isNearbyRect (llx, lly, urx, ury) = isNearby llx lly urx ury
+
+-- | Squared distance from a text fragment's position to the nearest edge
+-- of a rectangle.  Returns 0 when the point lies inside the rectangle.
+rectDist :: (Double, Double, Double, Double) -> TextFragment -> Double
+rectDist (llx, lly, urx, ury) tf =
+  let tx = fragmentX tf
+      ty = fragmentY tf
+      dx = max 0 (max (llx - tx) (tx - urx))
+      dy = max 0 (max (lly - ty) (ty - ury))
+  in dx * dx + dy * dy
 
 -- ---------------------------------------------------------------------------
 -- Proximity matching

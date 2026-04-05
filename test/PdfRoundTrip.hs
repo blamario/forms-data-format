@@ -10,7 +10,8 @@ import Data.List (foldl')
 import System.Exit (exitFailure, exitSuccess)
 
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
-import Text.FDF.PDF (PDF (..), parsePDF, fillPDF, serializePDF)
+import qualified Text.FDF as FDF
+import Text.FDF.PDF (PDF (..), parsePDF, fillPDF, serializePDF, fieldLabels)
 
 -- ---------------------------------------------------------------------------
 -- Minimal test PDF construction
@@ -94,6 +95,25 @@ noFieldsPDF = makePDF
   , "<< /Type /Pages /Kids [] /Count 0 >>"
   , "<< /Fields [] >>"
   ]
+
+-- | A PDF with page content stream text that labels form fields.
+-- "First Name:" is drawn near the @FirstName@ field,
+-- "Email:" is drawn near the @Email@ field.
+labelledPDF :: BS.ByteString
+labelledPDF =
+  let streamData = "BT\n/Helv 12 Tf\n1 0 0 1 100 750 Tm\n(First Name:) Tj\n1 0 0 1 100 650 Tm\n(Email:) Tj\nET"
+      streamObj  = "<< /Length " <> BSC.pack (show (BS.length streamData))
+                    <> " >>\nstream\n" <> streamData <> "\nendstream"
+  in makePDF
+    [ "<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>"
+    , "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>"
+    , "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Annots [ 7 0 R 8 0 R ] /Resources << /Font << /Helv 5 0 R >> >> >>"
+    , streamObj
+    , "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+    , "<< /Fields [ 7 0 R 8 0 R ] /DR << /Font << /Helv 5 0 R >> >> >>"
+    , "<< /Type /Annot /Subtype /Widget /FT /Tx /T (FirstName) /V () /Rect [100 730 400 745] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>"
+    , "<< /Type /Annot /Subtype /Widget /FT /Tx /T (Email) /V () /Rect [100 630 400 645] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>"
+    ]
 
 -- ---------------------------------------------------------------------------
 -- Test runner
@@ -251,11 +271,11 @@ testBinaryStringParse :: FailRef -> IO ()
 testBinaryStringParse ref =
   case parsePDF binaryStringPDF of
     Left err  -> modifyIORef ref (("parsePDF binaryStringPDF: " <> err) :)
-    Right fdf -> do
+    Right pdf -> do
       assertM ref "binaryStringPDF: field name should be BinField" $
-        name (body fdf) == "BinField"
+        name (body $ form pdf) == "BinField"
       assertM ref "binaryStringPDF: field value should contain raw bytes" $
-        content (body fdf) == FieldValue "A\x80\xfeZ"
+        content (body $ form pdf) == FieldValue "A\x80\xfeZ"
 
 -- | fillPDF should be idempotent: applying the same FDF twice produces the
 -- same byte output as applying it once.
@@ -297,6 +317,54 @@ testFillNoFields ref =
              assertM ref "filled noFieldsPDF: form body should be Children []" $
                formContent filled == Children []
 
+-- | fieldLabels should return a list of Fields mirroring the form hierarchy
+-- where leaf values contain nearby page text.
+testFieldLabels :: FailRef -> IO ()
+testFieldLabels ref =
+  case parsePDF labelledPDF of
+    Left err  -> modifyIORef ref (("parsePDF labelledPDF: " <> err) :)
+    Right pdf ->
+      case fieldLabels pdf of
+        Left err -> modifyIORef ref (("fieldLabels: " <> err) :)
+        Right fields -> do
+          let findField n = [f | f <- fields, name f == n]
+          case findField "FirstName" of
+            [f] -> assertM ref "fieldLabels: FirstName label should be 'First Name:'" $
+                     content f == FieldValue "First Name:"
+            _   -> modifyIORef ref ("fieldLabels: FirstName field not found" :)
+          case findField "Email" of
+            [f] -> assertM ref "fieldLabels: Email label should be 'Email:'" $
+                     content f == FieldValue "Email:"
+            _   -> modifyIORef ref ("fieldLabels: Email field not found" :)
+
+-- | fieldLabels on a PDF with no form fields should return an empty list.
+testFieldLabelsNoFields :: FailRef -> IO ()
+testFieldLabelsNoFields ref =
+  case parsePDF noFieldsPDF of
+    Left err  -> modifyIORef ref (("parsePDF noFieldsPDF: " <> err) :)
+    Right pdf ->
+      case fieldLabels pdf of
+        Left err -> modifyIORef ref (("fieldLabels noFields: " <> err) :)
+        Right fields ->
+          assertM ref "fieldLabels: empty list for no-field PDF" $
+            null fields
+
+-- | FDF round-trip for non-ASCII values containing @)@.  Before the
+-- 'escapeRawBytes' fix, @serializeValue@ would produce UTF-16BE bytes
+-- containing a bare @0x29@ byte (the `)` encoding), which the parser would
+-- mistake for the string terminator, resulting in "Invalid UTF-16BE stream".
+testFdfUtf16RoundTrip :: FailRef -> IO ()
+testFdfUtf16RoundTrip ref =
+  let val = "caf\233 (aide)"  -- non-ASCII é plus parentheses
+      fdf = makeFillFDF Field { name = "T", content = FieldValue val }
+      fdfBytes = FDF.serialize fdf
+  in case FDF.parse fdfBytes of
+       Left err ->
+         modifyIORef ref (("FDF utf16 round-trip parse failed: " <> err) :)
+       Right fdf' ->
+         assertM ref "FDF utf16 round-trip: value should survive" $
+           content (body fdf') == FieldValue val
+
 -- ---------------------------------------------------------------------------
 -- Main
 
@@ -314,6 +382,9 @@ main = do
   run "float /Rect coords survive round-trip" testFloatRectRoundTrip
   run "binary bytes in literal string"        testBinaryStringParse
   run "fillPDF is idempotent"                testFillIdempotent
+  run "fieldLabels maps text to fields"      testFieldLabels
+  run "fieldLabels on no-field PDF"          testFieldLabelsNoFields
+  run "FDF UTF-16BE round-trip with parens"  testFdfUtf16RoundTrip
   failures <- readIORef failRef
   if null failures
     then do

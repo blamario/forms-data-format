@@ -17,6 +17,7 @@ module Text.FDF.PDF
   , parsePDF
   , fillPDF
   , serializePDF
+  , fieldLabels
   ) where
 
 import Data.ByteString (ByteString)
@@ -38,6 +39,7 @@ import qualified Data.Text.Encoding as Text
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
 import Text.FDF.PDF.Decompress (decompressStream)
 import Text.FDF.PDF.Decrypt (Decryptor, Encryptor, buildDecryptor)
+import Text.FDF.PDF.Labels (buildFieldLabels)
 import Text.FDF.PDF.Parse (parseIndirectObject, parseValue, dropWS, parseDict)
 import Text.FDF.PDF.Serialize (applyUpdate, appendIncrementalUpdate)
 import Text.FDF.PDF.Types
@@ -453,3 +455,62 @@ readDecimal :: ByteString -> Either String Int
 readDecimal bs = case BSC.readInt bs of
   Just (n, _) -> Right n
   Nothing     -> Left ("Expected decimal integer, got: " <> BSC.unpack (BS.take 10 bs))
+
+-- ---------------------------------------------------------------------------
+-- Field labels: text fragments associated with form fields
+
+-- | Extract a list of 'Field's that mirrors the AcroForm hierarchy, but
+-- where each leaf value is the nearby page text (its label) rather than the
+-- field's current value.
+--
+-- For each form field the function:
+--
+-- 1. reads the widget annotation's @\/Rect@ and @\/P@ (page reference);
+-- 2. loads and decompresses the page's @\/Contents@ stream;
+-- 3. extracts positioned text fragments from the content stream;
+-- 4. selects text whose position is close to the field's rectangle.
+--
+-- The result preserves the field hierarchy: parent fields with named
+-- children produce 'Children' nodes.  Fields without a locatable label
+-- get an empty 'FieldValue'.
+fieldLabels :: PDF -> Either String [Field]
+fieldLabels pdf = do
+  let bs = source pdf
+  (_, xref, _trailer, dec, _enc, fieldsArr) <- loadAcroFormFields bs
+  let objLoader  = loadObject bs xref dec
+      pageLoader = loadPageStream bs xref dec
+  buildFieldLabels objLoader pageLoader fieldsArr
+
+-- | Load a page's decompressed content-stream bytes by page object number.
+loadPageStream :: ByteString -> XRef -> Decryptor -> Int -> Either String ByteString
+loadPageStream bs xref dec pageObjNum = do
+  pageDict <- loadDict bs xref dec (pageObjNum, 0)
+  loadContents bs xref dec pageDict
+
+-- | Load and concatenate the page's @\/Contents@ stream(s).
+-- @\/Contents@ may be a single stream reference or an array of references.
+loadContents
+  :: ByteString -> XRef -> Decryptor
+  -> Map ByteString PDFValue
+  -> Either String ByteString
+loadContents bs xref dec dict =
+  case Map.lookup "Contents" dict of
+    Nothing -> Right BS.empty  -- page with no content stream
+    Just (PDFRef n _) -> loadStreamBytes bs xref dec n
+    Just (PDFArray refs) -> do
+      chunks <- mapM (loadContentRef bs xref dec) refs
+      Right (BS.concat chunks)
+    _ -> Right BS.empty
+
+loadContentRef :: ByteString -> XRef -> Decryptor -> PDFValue -> Either String ByteString
+loadContentRef bs xref dec (PDFRef n _) = loadStreamBytes bs xref dec n
+loadContentRef _ _ _ _                  = Right BS.empty
+
+-- | Load a stream object by object number: parse, decrypt, and decompress.
+loadStreamBytes :: ByteString -> XRef -> Decryptor -> Int -> Either String ByteString
+loadStreamBytes bs xref dec objNum = do
+  off <- case IntMap.lookup objNum xref of
+    Just (XRefOffset o) -> Right o
+    _                   -> Left $ "Content stream object " <> show objNum <> " not at a byte offset"
+  (sdict, rawBytes) <- parseStreamAtIndirectLen bs xref dec objNum off
+  decompressStream sdict rawBytes

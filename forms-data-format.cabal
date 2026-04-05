@@ -26,8 +26,10 @@ source-repository head
 library
     exposed-modules:  Text.FDF
                       Text.FDF.PDF
-    other-modules:    Text.FDF.PDF.Decompress
+    other-modules:    Text.FDF.PDF.ContentStream
+                      Text.FDF.PDF.Decompress
                       Text.FDF.PDF.Decrypt
+                      Text.FDF.PDF.Labels
                       Text.FDF.PDF.Parse
                       Text.FDF.PDF.Serialize
                       Text.FDF.PDF.Types
@@ -76,6 +78,14 @@ executable pdf-to-fdf
 
 executable fdf-to-pdf
     main-is:          FdfToPdf.hs
+    hs-source-dirs:   app
+    default-language: Haskell2010
+    build-depends:    base == 4.*, bytestring,
+                      optparse-applicative >= 0.15 && < 0.19,
+                      forms-data-format
+
+executable pdf-to-labels
+    main-is:          PdfToLabels.hs
     hs-source-dirs:   app
     default-language: Haskell2010
     build-depends:    base == 4.*, bytestring,

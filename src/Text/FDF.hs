@@ -16,7 +16,7 @@ import Control.Applicative ((<*), (<*>), (<|>), many, some, optional)
 import Data.Bifunctor (bimap)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
-import Data.Char (chr, digitToInt, isAscii, isAlpha, isAlphaNum, isSpace, ord)
+import Data.Char (chr, digitToInt, isSpace, ord)
 import Data.List.NonEmpty (NonEmpty((:|)), nonEmpty)
 import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
 import Data.Monoid.Textual (singleton, toString, toText)
@@ -106,11 +106,11 @@ leafValue (FieldValue v)     = Just v
 leafValue (FieldNameValue v) = Just v
 leafValue (Children _)       = Nothing
 
--- | Return a setter for the text value of a leaf 'FieldContent' that tries to preserve
--- its construtor, or 'Nothing' for 'Children' nodes.
+-- | Return a setter for the text value of a leaf 'FieldContent' that preserves
+-- its type, or 'Nothing' for 'Children' nodes.
 leafValueSetter :: FieldContent -> Maybe (Text -> FieldContent)
 leafValueSetter (FieldValue _)     = Just FieldValue
-leafValueSetter (FieldNameValue _) = Just toFieldContent
+leafValueSetter (FieldNameValue _) = Just FieldNameValue
 leafValueSetter (Children _)       = Nothing
 
 insertAmong :: NonEmpty Text -> Text -> [Field] -> [Field]
@@ -140,7 +140,7 @@ mapWithKey f x@FDF{body} = x{body = mapFieldWithKey f body}
 
 mapFieldWithKey :: ([Text] -> Text -> Text) -> Field -> Field
 mapFieldWithKey f x@Field{name, content=FieldValue v} = x{content = FieldValue $ f [name] v}
-mapFieldWithKey f x@Field{name, content=FieldNameValue v} = x{content = toFieldContent $ f [name] v}
+mapFieldWithKey f x@Field{name, content=FieldNameValue v} = x{content = FieldNameValue $ f [name] v}
 mapFieldWithKey f x@Field{name, content=Children kids} = x{content = Children $ mapFieldWithKey (f . (name:)) <$> kids}
 
 foldMapWithKey :: Monoid a => ([Text] -> Text -> a) -> FDF -> a
@@ -156,7 +156,7 @@ traverseWithKey f x@FDF{body} = (\body'-> x{body = body'}) <$> traverseFieldWith
 
 traverseFieldWithKey :: Applicative f => ([Text] -> Text -> f Text) -> Field -> f Field
 traverseFieldWithKey f Field{name, content = FieldValue v} = Field name . FieldValue <$> f [name] v
-traverseFieldWithKey f Field{name, content = FieldNameValue v} = Field name . toFieldContent <$> f [name] v
+traverseFieldWithKey f Field{name, content = FieldNameValue v} = Field name . FieldNameValue <$> f [name] v
 traverseFieldWithKey f Field{name, content = Children kids} =
   Field name . Children <$> traverse (traverseFieldWithKey $ f . (name:)) kids
 
@@ -184,7 +184,7 @@ serializeField Field{name, content = FieldValue v} =
 serializeField Field{name, content = FieldNameValue v} =
   "<<\n"
   <> "/T (" <> encodeUtf8 name <> ")\n"
-  <> "/V " <> (if isNameValid v then "/" <> encodeUtf8 v else "(" <> serializeValue v <> ")") <> "\n"
+  <> "/V /" <> encodeUtf8 v <> "\n"
   <> ">>"
 serializeField Field{name, content = Children kids} =
   "<<\n"
@@ -227,11 +227,6 @@ escapeRawBytes = ByteString.concatMap $ \b -> case b of
   0x5C -> "\\\\"
   _    -> ByteString.singleton b
 
-toFieldContent :: Text -> FieldContent
-toFieldContent v = if isNameValid v then FieldNameValue v else FieldValue v
-
-isNameValid :: Text -> Bool
-isNameValid v = not (Text.null v) && isAlpha (Text.head v) && Text.all (\c-> isAscii c && isAlphaNum c) v
 
 parse :: ByteString -> Either String FDF
 parse input =

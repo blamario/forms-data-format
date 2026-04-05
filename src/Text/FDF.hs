@@ -16,7 +16,7 @@ import Control.Applicative ((<*), (<*>), (<|>), many, some, optional)
 import Data.Bifunctor (bimap)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
-import Data.Char (chr, digitToInt, isAscii, isAlpha, isAlphaNum, isSpace, ord)
+import Data.Char (chr, digitToInt, isAscii, isAlphaNum, isSpace, ord)
 import Data.List.NonEmpty (NonEmpty((:|)), nonEmpty)
 import Data.Monoid.Instances.ByteString.UTF8 (ByteStringUTF8 (ByteStringUTF8))
 import Data.Monoid.Textual (singleton, toString, toText)
@@ -231,7 +231,7 @@ toFieldContent :: Text -> FieldContent
 toFieldContent v = if isNameValid v then FieldNameValue v else FieldValue v
 
 isNameValid :: Text -> Bool
-isNameValid v = not (Text.null v) && isAlpha (Text.head v) && Text.all (\c-> isAscii c && isAlphaNum c) v
+isNameValid v = Text.all (\c-> isAscii c && isAlphaNum c) v
 
 parse :: ByteString -> Either String FDF
 parse input =

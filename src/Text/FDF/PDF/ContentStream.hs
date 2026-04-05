@@ -87,81 +87,78 @@ tokenize = go . dropCSWS
 -- The operand stack is kept in reverse order (last pushed operand at head).
 step :: (TextState, [Operand]) -> Token -> ((TextState, [Operand]), [TextFragment])
 step (ts, stk) (TokOperand v)    = ((ts, v : stk), [])
-step (ts, stk) (TokOperator op)  = let (ts', frags) = handleOp ts stk op
-                                    in ((ts', []), frags)
+step (ts, stk) (TokOperator op)  = let (ts', stk', frags) = handleOp ts stk op
+                                    in ((ts', stk'), frags)
 step (ts, stk) TokSkip           = ((ts, stk), [])
 
 -- | Interpret one operator, consuming the operand stack (in reverse order)
--- and returning the updated 'TextState' plus any emitted 'TextFragment's.
-handleOp :: TextState -> [Operand] -> ByteString -> (TextState, [TextFragment])
-handleOp ts _stk "BT" =
-  -- Begin text object: reset operand stack, keep text state
-  (ts, [])
-handleOp ts _stk "ET" =
+-- and returning the updated 'TextState', the remaining stack, and any
+-- emitted 'TextFragment's.  Each operator pops only the operands it needs,
+-- like Forth stack operations.
+handleOp :: TextState -> [Operand] -> ByteString -> (TextState, [Operand], [TextFragment])
+handleOp ts stk "BT" =
+  -- Begin text object
+  (ts, stk, [])
+handleOp ts stk "ET" =
   -- End text object
-  (ts, [])
+  (ts, stk, [])
 handleOp ts stk "Tf" =
   -- /FontName fontSize Tf
-  let sz = case stk of
-             [OpNum s, _] -> s
-             _            -> tsSize ts
-  in (ts { tsSize = sz }, [])
+  case stk of
+    OpNum s : _ : rest -> (ts { tsSize = s }, rest, [])
+    _                  -> (ts, stk, [])
 handleOp ts stk "TL" =
   -- leading TL
-  let ld = case stk of
-             [OpNum l] -> l
-             _         -> tsLead ts
-  in (ts { tsLead = ld }, [])
+  case stk of
+    OpNum l : rest -> (ts { tsLead = l }, rest, [])
+    _              -> (ts, stk, [])
 handleOp ts stk "Tm" =
   -- a b c d e f Tm — set text matrix
-  let (x, y) = case stk of
-                 [OpNum f, OpNum e, _, _, _, _] -> (e, f)
-                 _                              -> (tsX ts, tsY ts)
-  in (ts { tsX = x, tsY = y }, [])
+  case stk of
+    OpNum f : OpNum e : _ : _ : _ : _ : rest -> (ts { tsX = e, tsY = f }, rest, [])
+    _                                        -> (ts, stk, [])
 handleOp ts stk "Td" =
   -- tx ty Td — relative move
-  let (tx, ty) = case stk of
-                   [OpNum y, OpNum x] -> (x, y)
-                   _                  -> (0, 0)
-  in (ts { tsX = tsX ts + tx, tsY = tsY ts + ty }, [])
+  case stk of
+    OpNum ty : OpNum tx : rest -> (ts { tsX = tsX ts + tx, tsY = tsY ts + ty }, rest, [])
+    _                          -> (ts, stk, [])
 handleOp ts stk "TD" =
   -- tx ty TD — like Td but also sets TL = -ty
-  let (tx, ty) = case stk of
-                   [OpNum y, OpNum x] -> (x, y)
-                   _                  -> (0, 0)
-  in (ts { tsX = tsX ts + tx, tsY = tsY ts + ty, tsLead = negate ty }, [])
-handleOp ts _stk "T*" =
+  case stk of
+    OpNum ty : OpNum tx : rest -> (ts { tsX = tsX ts + tx, tsY = tsY ts + ty, tsLead = negate ty }, rest, [])
+    _                          -> (ts, stk, [])
+handleOp ts stk "T*" =
   -- Move to start of next line (0 -TL Td)
-  (ts { tsY = tsY ts - tsLead ts }, [])
+  (ts { tsY = tsY ts - tsLead ts }, stk, [])
 handleOp ts stk "Tj" =
   -- (string) Tj — show text
   case stk of
-    [OpStr s] -> (ts, [mkFrag ts s])
-    _         -> (ts, [])
+    OpStr s : rest -> (ts, rest, [mkFrag ts s])
+    _              -> (ts, stk, [])
 handleOp ts stk "TJ" =
   -- [ (str) kern ... ] TJ — show text with kerning
   case stk of
-    [OpArray elems] ->
+    OpArray elems : rest ->
       let strs = [s | OpStr s <- elems]
       in case strs of
-           [] -> (ts, [])
-           _  -> (ts, [mkFrag ts (BS.concat strs)])
-    _ -> (ts, [])
+           [] -> (ts, rest, [])
+           _  -> (ts, rest, [mkFrag ts (BS.concat strs)])
+    _ -> (ts, stk, [])
 handleOp ts stk "'" =
   -- (string) ' — T* then Tj
   let ts' = ts { tsY = tsY ts - tsLead ts }
   in case stk of
-       [OpStr s] -> (ts', [mkFrag ts' s])
-       _         -> (ts', [])
+       OpStr s : rest -> (ts', rest, [mkFrag ts' s])
+       _              -> (ts', stk, [])
 handleOp ts stk "\"" =
   -- aw ac (string) " — set word/char spacing, T*, Tj
   let ts' = ts { tsY = tsY ts - tsLead ts }
   in case stk of
-       [OpStr s, _, _] -> (ts', [mkFrag ts' s])
-       _               -> (ts', [])
+       OpStr s : _ : _ : rest -> (ts', rest, [mkFrag ts' s])
+       _                      -> (ts', stk, [])
 handleOp ts _stk _ =
   -- Unknown operator: discard operand stack
-  (ts, [])
+  (ts, [], [])
 
 mkFrag :: TextState -> ByteString -> TextFragment
 mkFrag ts raw = TextFragment

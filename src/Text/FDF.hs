@@ -106,8 +106,8 @@ leafValue (FieldValue v)     = Just v
 leafValue (FieldNameValue v) = Just v
 leafValue (Children _)       = Nothing
 
--- | Return a setter for the text value of a leaf 'FieldContent' that preserves
--- its type, or 'Nothing' for 'Children' nodes.
+-- | Return a setter for the text value of a leaf 'FieldContent' that tries to preserve
+-- its construtor, or 'Nothing' for 'Children' nodes.
 leafValueSetter :: FieldContent -> Maybe (Text -> FieldContent)
 leafValueSetter (FieldValue _)     = Just FieldValue
 leafValueSetter (FieldNameValue _) = Just toFieldContent
@@ -184,7 +184,7 @@ serializeField Field{name, content = FieldValue v} =
 serializeField Field{name, content = FieldNameValue v} =
   "<<\n"
   <> "/T (" <> encodeUtf8 name <> ")\n"
-  <> "/V /" <> serializeValue v <> "\n"
+  <> "/V " <> (if isNameValid v then "/" <> encodeUtf8 v else "(" <> serializeValue v <> ")") <> "\n"
   <> ">>"
 serializeField Field{name, content = Children kids} =
   "<<\n"

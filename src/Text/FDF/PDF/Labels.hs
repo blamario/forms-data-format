@@ -14,6 +14,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.List (nub)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -53,7 +54,7 @@ buildFieldLabels loadObj loadPage fieldsArr = do
   -- First pass: collect all page object numbers so we can batch
   -- page-content loading.
   allPages <- collectAllPages loadObj [] fieldsArr
-  let pageObjNums = unique allPages
+  let pageObjNums = nub allPages
   -- Load page text fragments, keyed by page object number.
   pageTexts <- mapM (\p -> (,) p <$> loadPageFragments loadPage p) pageObjNums
   let pageTextMap = Map.fromList pageTexts
@@ -235,11 +236,4 @@ toDouble (PDFInt n)  = Just (fromIntegral n)
 toDouble (PDFReal r) = Just r
 toDouble _           = Nothing
 
--- | Deduplicate a list preserving order.
-unique :: Eq a => [a] -> [a]
-unique = go []
-  where
-    go _ []     = []
-    go seen (x:xs)
-      | x `elem` seen = go seen xs
-      | otherwise      = x : go (x : seen) xs
+

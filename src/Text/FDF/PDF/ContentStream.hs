@@ -185,9 +185,7 @@ data Token
   | TokSkip        -- ^ consumed whitespace / comment / unknown
 
 nextToken :: ByteString -> Maybe (Token, ByteString)
-nextToken bs
-  | BS.null bs = Nothing
-  | otherwise  =
+nextToken bs =
       let bs' = dropCSWS bs
       in if BS.null bs' then Nothing
          else Just (tokenAt bs')
@@ -296,7 +294,6 @@ parseNumber bs =
        Just (n, r) | BS.null r || not (BSC.head r == '.' || BSC.head r == 'e' || BSC.head r == 'E')
                    -> Just (fromIntegral n, rest)
        _           -> case reads (BSC.unpack numStr) of
-                        [(d, "")] -> Just (d, rest)
                         [(d, _)]  -> Just (d, rest)
                         _         -> Nothing
 

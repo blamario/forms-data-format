@@ -184,7 +184,7 @@ serializeField Field{name, content = FieldValue v} =
 serializeField Field{name, content = FieldNameValue v} =
   "<<\n"
   <> "/T (" <> encodeUtf8 name <> ")\n"
-  <> "/V /" <> encodeUtf8 v <> "\n"
+  <> "/V " <> (if canSerializeAsName v then "/" <> encodeUtf8 v else "(" <> serializeValue v <> ")") <> "\n"
   <> ">>"
 serializeField Field{name, content = Children kids} =
   "<<\n"
@@ -227,6 +227,14 @@ escapeRawBytes = ByteString.concatMap $ \b -> case b of
   0x5C -> "\\\\"
   _    -> ByteString.singleton b
 
+-- | Check if a value can be safely serialized as a bare PDF name token
+-- without @#xx@ hex escaping.  Per the PDF spec (§7.3.5), regular characters
+-- are those in the range @0x21@–@0x7E@ excluding @#@ and the delimiter
+-- characters @( ) < > [ ] { } / %@.  The empty name @\/@ is valid.
+canSerializeAsName :: Text -> Bool
+canSerializeAsName = Text.all isRegularNameChar
+  where isRegularNameChar c = c > ' ' && c <= '~'
+                           && c `notElem` ['#', '(', ')', '<', '>', '[', ']', '{', '}', '/', '%']
 
 parse :: ByteString -> Either String FDF
 parse input =

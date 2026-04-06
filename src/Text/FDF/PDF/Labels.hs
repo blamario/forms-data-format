@@ -63,8 +63,8 @@ data SearchZone = SearchZone
 -- For example, Canadian income tax forms have relevant text in the same
 -- horizontal line as the field box — use a wide left margin with a tight
 -- vertical margin.  To obtain different /kinds/ of labels (e.g. descriptions
--- vs. line numbers) call 'buildFieldLabels' multiple times with different
--- configurations.
+-- vs. line numbers) call 'Text.FDF.PDF.fieldLabelsWith' multiple times with
+-- different configurations.
 data LabelConfig = LabelConfig
   { lcSearchZone  :: SearchZone
     -- ^ Asymmetric proximity margins around each field box.
@@ -109,9 +109,10 @@ type FieldRect = (Int, Rect)
 -- Fields without a @\/Rect@ or @\/P@ (and thus without locatable labels)
 -- are included with an empty 'FieldValue'.
 --
+-- See 'Text.FDF.PDF.fieldLabelsWith' for the public entry point.
 -- To obtain different kinds of labels (e.g. descriptions vs. line numbers),
--- call this function multiple times with different 'LabelConfig' values
--- (e.g. one with a wide left margin and one with a wide right margin).
+-- call 'Text.FDF.PDF.fieldLabelsWith' multiple times with different
+-- 'LabelConfig' values.
 buildFieldLabels
   :: LabelConfig
   -> ObjLoader

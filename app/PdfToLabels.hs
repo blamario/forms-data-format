@@ -5,17 +5,22 @@
 
 module Main (main) where
 
-import Control.Applicative ((<|>))
+import Control.Applicative ((<|>), optional)
 import Data.ByteString qualified as ByteString
+import Data.Maybe (fromMaybe)
 import Options.Applicative qualified as OptsAp
 
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
 import Text.FDF qualified as FDF
-import Text.FDF.PDF (parsePDF, fieldLabels)
+import Text.FDF.PDF (parsePDF, fieldLabelsWith, LabelConfig (..), SearchZone (..), defaultLabelConfig)
 
 data Options = Options
-  { input  :: FilePath
-  , output :: FilePath
+  { input     :: FilePath
+  , output    :: FilePath
+  , optLeft   :: Maybe Double
+  , optRight  :: Maybe Double
+  , optAbove  :: Maybe Double
+  , optBelow  :: Maybe Double
   }
 
 optionsParser :: OptsAp.Parser Options
@@ -27,6 +32,36 @@ optionsParser = Options
          (OptsAp.metavar "<output.fdf>"
           <> OptsAp.help "Output FDF file (default: write to stdout)")
        <|> pure "-")
+  <*> optional (OptsAp.option OptsAp.auto
+        (OptsAp.long "left"
+         <> OptsAp.metavar "POINTS"
+         <> OptsAp.help "Search margin to the left of each field box (default: 60)"))
+  <*> optional (OptsAp.option OptsAp.auto
+        (OptsAp.long "right"
+         <> OptsAp.metavar "POINTS"
+         <> OptsAp.help "Search margin to the right of each field box (default: 60)"))
+  <*> optional (OptsAp.option OptsAp.auto
+        (OptsAp.long "above"
+         <> OptsAp.metavar "POINTS"
+         <> OptsAp.help "Search margin above each field box (default: 60)"))
+  <*> optional (OptsAp.option OptsAp.auto
+        (OptsAp.long "below"
+         <> OptsAp.metavar "POINTS"
+         <> OptsAp.help "Search margin below each field box (default: 60)"))
+
+-- | Build a 'LabelConfig' from command-line options, falling back to
+-- 'defaultLabelConfig' margins for any values not specified.
+buildConfig :: Options -> LabelConfig
+buildConfig opts =
+  let defZone = lcSearchZone defaultLabelConfig
+  in defaultLabelConfig
+       { lcSearchZone = SearchZone
+           { zoneLeft  = fromMaybe (zoneLeft defZone)  (optLeft opts)
+           , zoneRight = fromMaybe (zoneRight defZone) (optRight opts)
+           , zoneAbove = fromMaybe (zoneAbove defZone) (optAbove opts)
+           , zoneBelow = fromMaybe (zoneBelow defZone) (optBelow opts)
+           }
+       }
 
 main :: IO ()
 main = do
@@ -41,7 +76,8 @@ main = do
   pdf <- case parsePDF pdfBytes of
     Left err  -> ioError (userError $ "Error reading PDF: " <> err)
     Right pdf -> return pdf
-  labels <- case fieldLabels pdf of
+  let config = buildConfig opts
+  labels <- case fieldLabelsWith config pdf of
     Left err  -> ioError (userError $ "Error extracting labels: " <> err)
     Right ls  -> return ls
   let fdfBody = case labels of

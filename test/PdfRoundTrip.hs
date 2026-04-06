@@ -11,7 +11,7 @@ import System.Exit (exitFailure, exitSuccess)
 
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
 import qualified Text.FDF as FDF
-import Text.FDF.PDF (PDF (..), parsePDF, fillPDF, serializePDF, fieldLabels)
+import Text.FDF.PDF (PDF (..), parsePDF, fillPDF, serializePDF, fieldLabels, fieldLabelsWith, LabelConfig (..), SearchZone (..), defaultLabelConfig)
 
 -- ---------------------------------------------------------------------------
 -- Minimal test PDF construction
@@ -349,6 +349,43 @@ testFieldLabelsNoFields ref =
           assertM ref "fieldLabels: empty list for no-field PDF" $
             null fields
 
+-- | fieldLabelsWith defaultLabelConfig should behave identically to fieldLabels.
+testFieldLabelsWithDefault :: FailRef -> IO ()
+testFieldLabelsWithDefault ref =
+  case parsePDF labelledPDF of
+    Left err  -> modifyIORef ref (("parsePDF labelledPDF: " <> err) :)
+    Right pdf -> do
+      let defResult = fieldLabelsWith defaultLabelConfig pdf
+          stdResult = fieldLabels pdf
+      case (defResult, stdResult) of
+        (Right df, Right sf) ->
+          assertM ref "fieldLabelsWith defaultLabelConfig == fieldLabels" (df == sf)
+        (Left err, _) ->
+          modifyIORef ref (("fieldLabelsWith default: " <> err) :)
+        (_, Left err) ->
+          modifyIORef ref (("fieldLabels: " <> err) :)
+
+-- | fieldLabelsWith a very tight vertical margin should exclude labels
+-- that are far above or below the field box.
+testFieldLabelsWithTightMargin :: FailRef -> IO ()
+testFieldLabelsWithTightMargin ref =
+  case parsePDF labelledPDF of
+    Left err  -> modifyIORef ref (("parsePDF labelledPDF: " <> err) :)
+    Right pdf -> do
+      -- In labelledPDF, "First Name:" is drawn at Y=750 but the field Rect
+      -- is [100 730 400 745], so it's 5pt above the top edge.  With a 1pt
+      -- vertical margin this label should be excluded.
+      let tightConfig = defaultLabelConfig
+            { lcSearchZone = SearchZone 60 60 1 1 }
+      case fieldLabelsWith tightConfig pdf of
+        Left err -> modifyIORef ref (("fieldLabelsWith tight: " <> err) :)
+        Right fields -> do
+          let findField n = [f | f <- fields, name f == n]
+          case findField "FirstName" of
+            [f] -> assertM ref "tight margin: FirstName label should be empty" $
+                     content f == FieldValue ""
+            _   -> modifyIORef ref ("tight margin: FirstName field not found" :)
+
 -- | FDF round-trip for non-ASCII values containing @)@.  Before the
 -- 'escapeRawBytes' fix, @serializeValue@ would produce UTF-16BE bytes
 -- containing a bare @0x29@ byte (the `)` encoding), which the parser would
@@ -384,6 +421,8 @@ main = do
   run "fillPDF is idempotent"                testFillIdempotent
   run "fieldLabels maps text to fields"      testFieldLabels
   run "fieldLabels on no-field PDF"          testFieldLabelsNoFields
+  run "fieldLabelsWith default == fieldLabels" testFieldLabelsWithDefault
+  run "fieldLabelsWith tight vertical margin" testFieldLabelsWithTightMargin
   run "FDF UTF-16BE round-trip with parens"  testFdfUtf16RoundTrip
   failures <- readIORef failRef
   if null failures

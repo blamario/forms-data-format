@@ -12,6 +12,9 @@
 
 module Text.FDF.PDF.Labels (
   buildFieldLabels,
+  LabelConfig (..),
+  SearchZone (..),
+  defaultLabelConfig,
 ) where
 
 import Data.ByteString (ByteString)
@@ -42,6 +45,43 @@ type ObjLoader = PDFValue -> Either String PDFValue
 type PageStreamLoader = Int -> Either String ByteString
 
 -- ---------------------------------------------------------------------------
+-- Configuration types
+
+-- | Which spatial zones around a field box to search for label text.
+-- Each margin is measured in PDF points (1 pt = 1\/72 inch).
+data SearchZone = SearchZone
+  { zoneLeft   :: !Double   -- ^ margin to the left of the box
+  , zoneRight  :: !Double   -- ^ margin to the right of the box
+  , zoneAbove  :: !Double   -- ^ margin above the box
+  , zoneBelow  :: !Double   -- ^ margin below the box
+  } deriving (Eq, Show)
+
+-- | Configuration controlling how text fragments are matched to fields.
+--
+-- Use 'defaultLabelConfig' for the standard 60 pt uniform margin.
+-- For form-specific matching, adjust the 'SearchZone' margins.
+-- For example, Canadian income tax forms have relevant text in the same
+-- horizontal line as the field box — use a wide left margin with a tight
+-- vertical margin.  To obtain different /kinds/ of labels (e.g. descriptions
+-- vs. line numbers) call 'buildFieldLabels' multiple times with different
+-- configurations.
+data LabelConfig = LabelConfig
+  { lcSearchZone  :: SearchZone
+    -- ^ Asymmetric proximity margins around each field box.
+  , lcSeparator   :: Text
+    -- ^ Separator used when concatenating fragment texts into a label value.
+    -- Default: @\" \"@ (single space).
+  } deriving (Eq, Show)
+
+-- | Default configuration matching the original behaviour:
+-- 60 pt margin in all directions, fragments joined by a single space.
+defaultLabelConfig :: LabelConfig
+defaultLabelConfig = LabelConfig
+  { lcSearchZone = SearchZone 60 60 60 60
+  , lcSeparator  = " "
+  }
+
+-- ---------------------------------------------------------------------------
 -- Rectangle type
 
 -- | A PDF bounding rectangle with lower-left and upper-right corners.
@@ -68,12 +108,17 @@ type FieldRect = (Int, Rect)
 --
 -- Fields without a @\/Rect@ or @\/P@ (and thus without locatable labels)
 -- are included with an empty 'FieldValue'.
+--
+-- To obtain different kinds of labels (e.g. descriptions vs. line numbers),
+-- call this function multiple times with different 'LabelConfig' values
+-- (e.g. one with a wide left margin and one with a wide right margin).
 buildFieldLabels
-  :: ObjLoader
+  :: LabelConfig
+  -> ObjLoader
   -> PageStreamLoader
   -> [PDFValue]           -- ^ the AcroForm @\/Fields@ array entries
   -> Either String [Field]
-buildFieldLabels loadObj loadPage fieldsArr = do
+buildFieldLabels config loadObj loadPage fieldsArr = do
   -- First pass: collect all page object numbers so we can batch
   -- page-content loading.
   allPages <- collectAllPages loadObj [] fieldsArr
@@ -84,9 +129,9 @@ buildFieldLabels loadObj loadPage fieldsArr = do
   -- Collect all leaf field bounding rectangles.
   allRects <- collectLeafRects loadObj fieldsArr
   -- Assign each text fragment exclusively to the nearest field.
-  let assignments = assignExclusively pageTextMap allRects
+  let assignments = assignExclusively config pageTextMap allRects
   -- Second pass: build the Field tree with labels.
-  buildLabelFields loadObj assignments [] fieldsArr
+  buildLabelFields config loadObj assignments [] fieldsArr
 
 -- ---------------------------------------------------------------------------
 -- Field hierarchy building
@@ -94,36 +139,39 @@ buildFieldLabels loadObj loadPage fieldsArr = do
 -- | Walk the AcroForm field hierarchy and produce a list of 'Field's where
 -- leaf values are the nearby text labels.
 buildLabelFields
-  :: ObjLoader
+  :: LabelConfig
+  -> ObjLoader
   -> Map FieldRect [Text]      -- ^ exclusive text assignments
   -> [Text]                    -- ^ path prefix (ancestor names)
   -> [PDFValue]                -- ^ field references
   -> Either String [Field]
-buildLabelFields loadObj assignments prefix refs = do
-  mFields <- mapM (buildLabelField loadObj assignments prefix) refs
+buildLabelFields config loadObj assignments prefix refs = do
+  mFields <- mapM (buildLabelField config loadObj assignments prefix) refs
   Right [f | Just f <- mFields]
 
 buildLabelField
-  :: ObjLoader
+  :: LabelConfig
+  -> ObjLoader
   -> Map FieldRect [Text]
   -> [Text]
   -> PDFValue
   -> Either String (Maybe Field)
-buildLabelField loadObj assignments prefix ref = do
+buildLabelField config loadObj assignments prefix ref = do
   obj <- loadObj ref
   case obj of
-    PDFDict dict -> buildFromDict loadObj assignments prefix dict
+    PDFDict dict -> buildFromDict config loadObj assignments prefix dict
     _            -> Right Nothing
 
 -- | Build a 'Field' from a field dictionary.  Returns 'Nothing' for widget
 -- annotations without a @\/T@ entry (anonymous widgets).
 buildFromDict
-  :: ObjLoader
+  :: LabelConfig
+  -> ObjLoader
   -> Map FieldRect [Text]
   -> [Text]
   -> Map ByteString PDFValue
   -> Either String (Maybe Field)
-buildFromDict loadObj assignments prefix dict =
+buildFromDict config loadObj assignments prefix dict =
   case Map.lookup "T" dict of
     Nothing -> Right Nothing   -- anonymous widget → skip
     _ -> do
@@ -131,30 +179,30 @@ buildFromDict loadObj assignments prefix dict =
       let path = prefix ++ [fieldName]
       cont <- case Map.lookup "Kids" dict of
         Just (PDFArray kids) -> do
-          childFields <- buildLabelFields loadObj assignments path kids
+          childFields <- buildLabelFields config loadObj assignments path kids
           if null childFields
-            then leafLabel assignments dict  -- all kids are widgets → leaf
+            then leafLabel config assignments dict  -- all kids are widgets → leaf
             else Right (Children childFields)
         Just kidRef@PDFRef{} -> do
           kidsVal <- loadObj kidRef
           case kidsVal of
             PDFArray kids -> do
-              childFields <- buildLabelFields loadObj assignments path kids
+              childFields <- buildLabelFields config loadObj assignments path kids
               if null childFields
-                then leafLabel assignments dict
+                then leafLabel config assignments dict
                 else Right (Children childFields)
-            _ -> leafLabel assignments dict
-        _ -> leafLabel assignments dict
+            _ -> leafLabel config assignments dict
+        _ -> leafLabel config assignments dict
       Right $ Just Field { name = fieldName, content = cont }
 
 -- | Produce a leaf 'FieldContent' whose value is the concatenation of
 -- text fragments exclusively assigned to this field.
-leafLabel :: Map FieldRect [Text] -> Map ByteString PDFValue -> Either String FieldContent
-leafLabel assignments dict =
+leafLabel :: LabelConfig -> Map FieldRect [Text] -> Map ByteString PDFValue -> Either String FieldContent
+leafLabel config assignments dict =
   case extractRectAndPage dict of
     Just rect ->
       let nearby = fromMaybe [] (Map.lookup rect assignments)
-      in Right $ FieldValue (Text.intercalate " " nearby)
+      in Right $ FieldValue (Text.intercalate (lcSeparator config) nearby)
     Nothing -> Right (FieldValue "")
 
 -- ---------------------------------------------------------------------------
@@ -265,9 +313,10 @@ anyHasFieldName loadObj = fmap or . mapM check
 -- | Assign each text fragment to at most one field — the one whose
 -- bounding box is nearest.  This prevents overlapping proximity zones
 -- from causing the same label to appear under multiple fields.
-assignExclusively :: Map Int [TextFragment] -> [FieldRect] -> Map FieldRect [Text]
-assignExclusively pageTextMap allRects =
-  let rectsByPage :: Map Int [Rect]
+assignExclusively :: LabelConfig -> Map Int [TextFragment] -> [FieldRect] -> Map FieldRect [Text]
+assignExclusively config pageTextMap allRects =
+  let sz = lcSearchZone config
+      rectsByPage :: Map Int [Rect]
       rectsByPage = Map.fromListWith (++)
         [(p, [r]) | (p, r) <- allRects]
       assignPage pageNum frags =
@@ -275,7 +324,7 @@ assignExclusively pageTextMap allRects =
         | f <- frags
         , not (Text.null (Text.strip (fragmentText f)))
         , nr <- maybeToList
-            (nearestRect (fromMaybe [] (Map.lookup pageNum rectsByPage)) f)
+            (nearestRect sz (fromMaybe [] (Map.lookup pageNum rectsByPage)) f)
         ]
       allAssignments = concatMap
         (\(pn, frags) -> assignPage pn frags)
@@ -284,18 +333,18 @@ assignExclusively pageTextMap allRects =
        [(rect, [txt]) | (rect, txt) <- allAssignments]
 
 -- | Find the nearest field rectangle to a text fragment, considering only
--- rectangles within the proximity margin.  Returns 'Nothing' if no
+-- rectangles within the search zone.  Returns 'Nothing' if no
 -- rectangle is close enough.
-nearestRect :: [Rect] -> TextFragment -> Maybe Rect
-nearestRect rects tf =
-  case [(r, rectDist r tf) | r <- rects, isNearbyRect r tf] of
+nearestRect :: SearchZone -> [Rect] -> TextFragment -> Maybe Rect
+nearestRect sz rects tf =
+  case [(r, rectDist r tf) | r <- rects, isNearbyRect sz r tf] of
     []         -> Nothing
     candidates -> Just (fst (minimumBy (comparing snd) candidates))
 
--- | Check whether a text fragment is within the proximity margin of a
+-- | Check whether a text fragment is within the search zone of a
 -- rectangle.
-isNearbyRect :: Rect -> TextFragment -> Bool
-isNearbyRect (Rect llx lly urx ury) = isNearby llx lly urx ury
+isNearbyRect :: SearchZone -> Rect -> TextFragment -> Bool
+isNearbyRect sz (Rect llx lly urx ury) = isNearby sz llx lly urx ury
 
 -- | Squared distance from a text fragment's position to the nearest edge
 -- of a rectangle.  Returns 0 when the point lies inside the rectangle.
@@ -310,20 +359,14 @@ rectDist (Rect llx lly urx ury) tf =
 -- ---------------------------------------------------------------------------
 -- Proximity matching
 
--- | Proximity margin in PDF points (1 pt = 1\/72 inch).  Text fragments
--- within this distance of a field's bounding box are considered nearby
--- labels.  60 pt ≈ 0.83 in — generous enough to catch labels placed above,
--- below, or to the left\/right of typical form fields.
-proximityMargin :: Double
-proximityMargin = 60
-
--- | Determine whether a 'TextFragment' is "nearby" a given bounding box.
-isNearby :: Double -> Double -> Double -> Double -> TextFragment -> Bool
-isNearby llx lly urx ury tf =
+-- | Determine whether a 'TextFragment' is within the given 'SearchZone'
+-- of a bounding box.
+isNearby :: SearchZone -> Double -> Double -> Double -> Double -> TextFragment -> Bool
+isNearby sz llx lly urx ury tf =
   let tx = fragmentX tf
       ty = fragmentY tf
-      inXRange = tx >= llx - proximityMargin && tx <= urx + proximityMargin
-      inYRange = ty >= lly - proximityMargin && ty <= ury + proximityMargin
+      inXRange = tx >= llx - zoneLeft sz && tx <= urx + zoneRight sz
+      inYRange = ty >= lly - zoneBelow sz && ty <= ury + zoneAbove sz
   in inXRange && inYRange && not (Text.null (Text.strip (fragmentText tf)))
 
 -- ---------------------------------------------------------------------------

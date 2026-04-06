@@ -18,6 +18,10 @@ module Text.FDF.PDF
   , fillPDF
   , serializePDF
   , fieldLabels
+  , fieldLabelsWith
+  , LabelConfig (..)
+  , SearchZone (..)
+  , defaultLabelConfig
   ) where
 
 import Data.ByteString (ByteString)
@@ -39,7 +43,7 @@ import qualified Data.Text.Encoding as Text
 import Text.FDF (FDF (..), Field (..), FieldContent (..))
 import Text.FDF.PDF.Decompress (decompressStream)
 import Text.FDF.PDF.Decrypt (Decryptor, Encryptor, buildDecryptor)
-import Text.FDF.PDF.Labels (buildFieldLabels)
+import Text.FDF.PDF.Labels (buildFieldLabels, LabelConfig (..), SearchZone (..), defaultLabelConfig)
 import Text.FDF.PDF.Parse (parseIndirectObject, parseValue, dropWS, parseDict)
 import Text.FDF.PDF.Serialize (applyUpdate, appendIncrementalUpdate)
 import Text.FDF.PDF.Types
@@ -461,7 +465,7 @@ readDecimal bs = case BSC.readInt bs of
 
 -- | Extract a list of 'Field's that mirrors the AcroForm hierarchy, but
 -- where each leaf value is the nearby page text (its label) rather than the
--- field's current value.
+-- field's current value.  Uses 'defaultLabelConfig' (60 pt uniform margin).
 --
 -- For each form field the function:
 --
@@ -474,12 +478,20 @@ readDecimal bs = case BSC.readInt bs of
 -- children produce 'Children' nodes.  Fields without a locatable label
 -- get an empty 'FieldValue'.
 fieldLabels :: PDF -> Either String [Field]
-fieldLabels pdf = do
+fieldLabels = fieldLabelsWith defaultLabelConfig
+
+-- | Like 'fieldLabels', but with a caller-supplied 'LabelConfig' to control
+-- the search zone margins and separator.
+--
+-- To obtain different kinds of labels (e.g. descriptions vs. line numbers),
+-- call this function multiple times with different 'LabelConfig' values.
+fieldLabelsWith :: LabelConfig -> PDF -> Either String [Field]
+fieldLabelsWith config pdf = do
   let bs = source pdf
   (_, xref, _trailer, dec, _enc, fieldsArr) <- loadAcroFormFields bs
   let objLoader  = loadObject bs xref dec
       pageLoader = loadPageStream bs xref dec
-  buildFieldLabels objLoader pageLoader fieldsArr
+  buildFieldLabels config objLoader pageLoader fieldsArr
 
 -- | Load a page's decompressed content-stream bytes by page object number.
 loadPageStream :: ByteString -> XRef -> Decryptor -> Int -> Either String ByteString
